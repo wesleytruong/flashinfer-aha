@@ -30,6 +30,7 @@
 #include "../vec_dtypes.cuh"
 #include "cascade.cuh"
 #include "state.cuh"
+#include "variant_helper.cuh"
 
 namespace flashinfer {
 
@@ -429,6 +430,21 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
   const uint32_t chunk_size = chunk_end - chunk_start;
 
+  // Per-head router: compute first valid tile iteration for tile-level SWA skip
+  constexpr uint32_t tile_width = tile_size_per_bdx * bdy * bdz;
+  uint32_t first_valid_iter = 0;
+  if constexpr (has_maybe_router_v<Params>) {
+    if (params.maybe_router != nullptr &&
+        params.maybe_router[batch_idx * params.paged_kv.num_heads + kv_head_idx]) {
+      // This head uses SWA: skip tiles entirely before the window
+      uint32_t window = (params.window_left >= 0) ? (uint32_t)params.window_left : kv_len;
+      uint32_t swa_start = (kv_len > window) ? kv_len - window : 0;
+      if (swa_start > chunk_start) {
+        first_valid_iter = (swa_start - chunk_start) / tile_width;
+      }
+    }
+  }
+
   AttentionVariant variant(params, batch_idx, smem);
   DTypeKV* k_smem = (DTypeKV*)smem;
   DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
@@ -501,7 +517,8 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           paged_kv.k_data + kv_offset[j],
-          ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+          ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size &&
+              iter >= first_valid_iter);
     }
     cp_async::commit_group();
 #pragma unroll
@@ -510,7 +527,8 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           paged_kv.v_data + kv_offset[j],
-          ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+          ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size &&
+              iter >= first_valid_iter);
     }
     cp_async::commit_group();
     stage_idx = (stage_idx + 1) % num_stages_smem;
@@ -536,13 +554,15 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
-        params, variant, batch_idx,
-        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
-        (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
-            chunk_start + iter * tile_size_per_bdx * bdy * bdz,
-        iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st, tx, ty,
-        tz);
+    if (iter >= first_valid_iter) {
+      compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
+          params, variant, batch_idx,
+          k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
+          (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
+              chunk_start + iter * tile_size_per_bdx * bdy * bdz,
+          iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st, tx, ty,
+          tz);
+    }
     block.sync();
 
 #pragma unroll
@@ -560,15 +580,19 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           paged_kv.k_data + kv_offset[j],
-          (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+          (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size &&
+              (iter + num_stages_smem) >= first_valid_iter);
     }
     cp_async::commit_group();
 
     // update m/d/o states
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
-        v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st, tx);
+    if (iter >= first_valid_iter) {
+      update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
+          v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st,
+          tx);
+    }
     block.sync();
 
     // load v tiles
@@ -578,7 +602,8 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           paged_kv.v_data + kv_offset[j],
-          (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+          (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size &&
+              (iter + num_stages_smem) >= first_valid_iter);
     }
     cp_async::commit_group();
     stage_idx = (stage_idx + 1) % num_stages_smem;

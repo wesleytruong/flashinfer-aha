@@ -403,6 +403,9 @@ def get_single_prefill_module(backend, *args):
 
 @functools.cache
 def get_batch_prefill_module(backend, *args):
+    # Check if use_router is enabled (11th positional arg after backend, or absent = False)
+    _use_router = args[10] if len(args) > 10 else False
+
     if backend == "trtllm-gen":
         uri = "trtllm_gen_context"
         module = get_trtllm_gen_prefill_module()
@@ -456,12 +459,13 @@ def get_batch_prefill_module(backend, *args):
         scale_q: Optional[torch.Tensor] = None,
         scale_k: Optional[torch.Tensor] = None,
         scale_v: Optional[torch.Tensor] = None,
+        maybe_router: Optional[torch.Tensor] = None,
     ) -> None:
         # Check if FP8 by presence of scale tensors
         is_fp8 = scale_q is not None
 
         if backend == "fa2":
-            ragged_run_func(
+            fa2_args = [
                 float_workspace_buffer,
                 int_workspace_buffer,
                 plan_info_vec,
@@ -482,12 +486,17 @@ def get_batch_prefill_module(backend, *args):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+            ]
+            if _use_router:
+                fa2_args.append(maybe_router)
+            fa2_args += [
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta,
                 token_pos_in_items_len,
-            )
+            ]
+            ragged_run_func(*fa2_args)
         elif is_fp8:
             # FA3 FP8: scale_q, scale_k, scale_v, sm_scale, scale_q_scalar, scale_k_scalar, scale_v_scalar
             scale_q_tensor, scale_q_scalar = _split_scale_param(scale_q)
@@ -574,6 +583,10 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        scale_q: Optional[torch.Tensor] = None,
+        scale_k: Optional[torch.Tensor] = None,
+        scale_v: Optional[torch.Tensor] = None,
+        maybe_router: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -634,6 +647,7 @@ def get_batch_prefill_module(backend, *args):
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        maybe_router: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -671,7 +685,7 @@ def get_batch_prefill_module(backend, *args):
             )
         elif backend == "fa2":
             assert not is_float8(q)
-            paged_run_func(
+            fa2_args = [
                 float_workspace_buffer,
                 int_workspace_buffer,
                 plan_info_vec,
@@ -694,12 +708,17 @@ def get_batch_prefill_module(backend, *args):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+            ]
+            if _use_router:
+                fa2_args.append(maybe_router)
+            fa2_args += [
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta
                 token_pos_in_items_len,
-            )
+            ]
+            paged_run_func(*fa2_args)
         else:
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
             if not is_float8(q):
@@ -804,6 +823,7 @@ def get_batch_prefill_module(backend, *args):
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        maybe_router: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -1436,6 +1456,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
+        use_router: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -1513,6 +1534,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._jit_module = None
 
         self._kv_layout = kv_layout
+        self._use_router = use_router
         if backend == "cudnn":
             assert kv_layout == "NHD", "CUDNN backend only supports NHD layout"
 
@@ -1930,6 +1952,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     window_left >= 0,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     use_fp16_qk_reduction,
+                    self._use_router,
                 )
 
                 self._cached_module = get_batch_prefill_module(
@@ -1967,6 +1990,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     block_id += num_blocks_needed
 
         if self._cached_module is not None:
+            # Planner needs full KV range when router is active (some heads use
+            # full attention); -1 tells the scheduler to use full kv_len.
+            plan_window_left = -1 if self._use_router else window_left
             args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -1983,7 +2009,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_qk,
                 head_dim_vo,
                 causal,
-                window_left,
+                # Tile scheduling window: planner uses full KV range when router
+                # is active (some heads need full attention). The real window_left
+                # is stored in self._window_left and passed to the kernel at run time.
+                plan_window_left,
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
@@ -2047,6 +2076,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        router: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -2064,6 +2094,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        router: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -2082,6 +2113,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        router: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -2120,6 +2152,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        router : Optional[torch.Tensor]
+            The per-head router tensor, shape: ``[batch_size, num_kv_heads]``, dtype: ``torch.uint8``.
+            0 = full attention, 1 = sliding window attention. Requires ``use_router=True`` on the wrapper.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2274,6 +2309,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._prefix_len_ptr,
                     self._token_pos_in_items_ptr,
                     self._max_item_len_ptr,
+                ]
+                run_args += [
                     logits_soft_cap,
                     sm_scale,
                     fp8_scale_q,
@@ -2296,6 +2333,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     sinks,
                     skip_softmax_threshold_scale_factor,
                 ]
+                if self._use_router:
+                    run_args.append(router)
 
             assert self._cached_module is not None, "cached module is not initialized"
             self._cached_module.paged_run(*run_args)

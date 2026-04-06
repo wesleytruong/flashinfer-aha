@@ -2101,8 +2101,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                    kv_tile_idx = kv_tile_indices[bx];
     auto smem = reinterpret_cast<uint8_t*>(&smem_storage);
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
-    const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
-                   window_left = variant.window_left;
+    const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len;
+    uint32_t window_left = variant.window_left;
+    // Per-head router: full-attention heads use window covering entire sequence
+    if constexpr (has_maybe_router_v<Params>) {
+      if (params.maybe_router != nullptr &&
+          !params.maybe_router[request_idx * num_kv_heads + kv_head_idx]) {
+        window_left = kv_len;
+      }
+    }
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
@@ -2361,8 +2368,20 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
-    const uint32_t num_kv_chunks =
-        ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+    uint32_t num_kv_chunks;
+    if constexpr (has_maybe_router_v<Params>) {
+      // When router is active, the planner scheduled tiles for full KV range
+      // (window_left=-1). num_kv_chunks must match that allocation so output/LSE
+      // writes use the correct stride. Out-of-window tiles produce -inf LSE and
+      // are discarded by the merge step.
+      if (params.maybe_router != nullptr) {
+        num_kv_chunks = ceil_div(kv_len_safe, kv_chunk_size);
+      } else {
+        num_kv_chunks = ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+      }
+    } else {
+      num_kv_chunks = ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+    }
 
     // transform output
     transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,

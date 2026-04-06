@@ -222,85 +222,173 @@ def get_batch_decode_module(*args):
     plan_func = mod.plan
     run_func = mod.run
 
+    # Check if use_router is enabled (10th positional arg, or absent = False)
+    _use_router = args[9] if len(args) > 9 else False
+
     # torch library for batch_decode_with_paged_kv_cache_run
 
-    @register_custom_op(
-        f"flashinfer::{uri}_run",
-        mutates_args=(
-            "float_workspace_buffer",
-            "int_workspace_buffer",
-            "paged_k_cache",
-            "paged_v_cache",
-            "o",
-            "maybe_lse",
-        ),
-    )
-    def run_batch_decode(
-        float_workspace_buffer: torch.Tensor,
-        int_workspace_buffer: torch.Tensor,
-        plan_info_vec: List[int],
-        q: torch.Tensor,
-        paged_k_cache: Optional[torch.Tensor],
-        paged_v_cache: Optional[torch.Tensor],
-        paged_kv_indptr: torch.Tensor,
-        paged_kv_indices: torch.Tensor,
-        paged_kv_last_page_len: torch.Tensor,
-        o: torch.Tensor,
-        maybe_lse: Optional[torch.Tensor],
-        kv_layout_code: int,
-        window_left: int,
-        enable_pdl: bool,
-        alibi_slopes: Optional[torch.Tensor],
-        logits_soft_cap: float,
-        sm_scale: float,
-        rope_scale: float,
-        rope_theta: float,
-    ) -> None:
-        run_func(
-            float_workspace_buffer,
-            int_workspace_buffer,
-            plan_info_vec,
-            q,
-            paged_k_cache,
-            paged_v_cache,
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
-            o,
-            maybe_lse,
-            kv_layout_code,
-            window_left,
-            enable_pdl,
-            alibi_slopes,
-            logits_soft_cap,
-            sm_scale,
-            1.0 / rope_scale,  # rope_rcp_scale
-            1.0 / rope_theta,  # rope_rcp_theta
-        )
+    if _use_router:
 
-    @register_fake_op(f"flashinfer::{uri}_run")
-    def _fake_run_batch_decode(
-        float_workspace_buffer: torch.Tensor,
-        int_workspace_buffer: torch.Tensor,
-        plan_info_vec: List[int],
-        q: torch.Tensor,
-        paged_k_cache: Optional[torch.Tensor],
-        paged_v_cache: Optional[torch.Tensor],
-        paged_kv_indptr: torch.Tensor,
-        paged_kv_indices: torch.Tensor,
-        paged_kv_last_page_len: torch.Tensor,
-        o: torch.Tensor,
-        maybe_lse: Optional[torch.Tensor],
-        kv_layout_code: int,
-        window_left: int,
-        enable_pdl: bool,
-        alibi_slopes: Optional[torch.Tensor],
-        logits_soft_cap: float,
-        sm_scale: float,
-        rope_scale: float,
-        rope_theta: float,
-    ) -> None:
-        pass
+        @register_custom_op(
+            f"flashinfer::{uri}_run",
+            mutates_args=(
+                "float_workspace_buffer",
+                "int_workspace_buffer",
+                "paged_k_cache",
+                "paged_v_cache",
+                "o",
+                "maybe_lse",
+            ),
+        )
+        def run_batch_decode(
+            float_workspace_buffer: torch.Tensor,
+            int_workspace_buffer: torch.Tensor,
+            plan_info_vec: List[int],
+            q: torch.Tensor,
+            paged_k_cache: Optional[torch.Tensor],
+            paged_v_cache: Optional[torch.Tensor],
+            paged_kv_indptr: torch.Tensor,
+            paged_kv_indices: torch.Tensor,
+            paged_kv_last_page_len: torch.Tensor,
+            o: torch.Tensor,
+            maybe_lse: Optional[torch.Tensor],
+            kv_layout_code: int,
+            window_left: int,
+            enable_pdl: bool,
+            alibi_slopes: Optional[torch.Tensor],
+            maybe_router: Optional[torch.Tensor],
+            logits_soft_cap: float,
+            sm_scale: float,
+            rope_scale: float,
+            rope_theta: float,
+        ) -> None:
+            run_func(
+                float_workspace_buffer,
+                int_workspace_buffer,
+                plan_info_vec,
+                q,
+                paged_k_cache,
+                paged_v_cache,
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+                o,
+                maybe_lse,
+                kv_layout_code,
+                window_left,
+                enable_pdl,
+                alibi_slopes,
+                maybe_router,
+                logits_soft_cap,
+                sm_scale,
+                1.0 / rope_scale,  # rope_rcp_scale
+                1.0 / rope_theta,  # rope_rcp_theta
+            )
+
+        @register_fake_op(f"flashinfer::{uri}_run")
+        def _fake_run_batch_decode(
+            float_workspace_buffer: torch.Tensor,
+            int_workspace_buffer: torch.Tensor,
+            plan_info_vec: List[int],
+            q: torch.Tensor,
+            paged_k_cache: Optional[torch.Tensor],
+            paged_v_cache: Optional[torch.Tensor],
+            paged_kv_indptr: torch.Tensor,
+            paged_kv_indices: torch.Tensor,
+            paged_kv_last_page_len: torch.Tensor,
+            o: torch.Tensor,
+            maybe_lse: Optional[torch.Tensor],
+            kv_layout_code: int,
+            window_left: int,
+            enable_pdl: bool,
+            alibi_slopes: Optional[torch.Tensor],
+            maybe_router: Optional[torch.Tensor],
+            logits_soft_cap: float,
+            sm_scale: float,
+            rope_scale: float,
+            rope_theta: float,
+        ) -> None:
+            pass
+
+    else:
+
+        @register_custom_op(
+            f"flashinfer::{uri}_run",
+            mutates_args=(
+                "float_workspace_buffer",
+                "int_workspace_buffer",
+                "paged_k_cache",
+                "paged_v_cache",
+                "o",
+                "maybe_lse",
+            ),
+        )
+        def run_batch_decode(
+            float_workspace_buffer: torch.Tensor,
+            int_workspace_buffer: torch.Tensor,
+            plan_info_vec: List[int],
+            q: torch.Tensor,
+            paged_k_cache: Optional[torch.Tensor],
+            paged_v_cache: Optional[torch.Tensor],
+            paged_kv_indptr: torch.Tensor,
+            paged_kv_indices: torch.Tensor,
+            paged_kv_last_page_len: torch.Tensor,
+            o: torch.Tensor,
+            maybe_lse: Optional[torch.Tensor],
+            kv_layout_code: int,
+            window_left: int,
+            enable_pdl: bool,
+            alibi_slopes: Optional[torch.Tensor],
+            logits_soft_cap: float,
+            sm_scale: float,
+            rope_scale: float,
+            rope_theta: float,
+        ) -> None:
+            run_func(
+                float_workspace_buffer,
+                int_workspace_buffer,
+                plan_info_vec,
+                q,
+                paged_k_cache,
+                paged_v_cache,
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+                o,
+                maybe_lse,
+                kv_layout_code,
+                window_left,
+                enable_pdl,
+                alibi_slopes,
+                logits_soft_cap,
+                sm_scale,
+                1.0 / rope_scale,  # rope_rcp_scale
+                1.0 / rope_theta,  # rope_rcp_theta
+            )
+
+        @register_fake_op(f"flashinfer::{uri}_run")
+        def _fake_run_batch_decode(
+            float_workspace_buffer: torch.Tensor,
+            int_workspace_buffer: torch.Tensor,
+            plan_info_vec: List[int],
+            q: torch.Tensor,
+            paged_k_cache: Optional[torch.Tensor],
+            paged_v_cache: Optional[torch.Tensor],
+            paged_kv_indptr: torch.Tensor,
+            paged_kv_indices: torch.Tensor,
+            paged_kv_last_page_len: torch.Tensor,
+            o: torch.Tensor,
+            maybe_lse: Optional[torch.Tensor],
+            kv_layout_code: int,
+            window_left: int,
+            enable_pdl: bool,
+            alibi_slopes: Optional[torch.Tensor],
+            logits_soft_cap: float,
+            sm_scale: float,
+            rope_scale: float,
+            rope_theta: float,
+        ) -> None:
+            pass
 
     # Register the module.
     #
@@ -668,6 +756,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
+        use_router: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
@@ -734,6 +823,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._jit_module = None
 
         self._kv_layout = kv_layout
+        self._use_router = use_router
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._int_workspace_buffer = torch.empty(
@@ -1066,6 +1156,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
+                    self._use_router,
                 )
 
             args = [
@@ -1084,7 +1175,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim,
                 head_dim,
                 False,  # causal
-                window_left,
+                -1 if self._use_router else window_left,
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size)
@@ -1107,6 +1198,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
+                    self._use_router,
                 )
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
@@ -1118,7 +1210,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 num_kv_heads,
                 page_size,
                 self.is_cuda_graph_enabled,
-                window_left,
+                -1 if self._use_router else window_left,
                 logits_soft_cap,
                 head_dim,
                 head_dim,
@@ -1215,6 +1307,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        router: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1391,6 +1484,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     sinks,
                     skip_softmax_threshold_scale_factor,
                 ]
+                if self._use_router:
+                    run_args.append(router)
 
             self._cached_module.paged_run(*run_args)
         else:
@@ -1421,8 +1516,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 run_args.extend(list(args))
             else:
+                run_args.append(_get_cache_alibi_slopes_buf(q.shape[1], q.device))
+                if self._use_router:
+                    run_args.append(router)
                 run_args += [
-                    _get_cache_alibi_slopes_buf(q.shape[1], q.device),
                     logits_soft_cap,
                     sm_scale,
                     rope_scale,

@@ -27,8 +27,10 @@
 namespace flashinfer {
 
 DEFINE_HAS_MEMBER(maybe_mask_indptr)
+DEFINE_HAS_MEMBER(num_kv_heads)
 
-template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
+template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi,
+          bool use_router = false>
 struct DefaultAttention : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
@@ -37,6 +39,8 @@ struct DefaultAttention : AttentionVariantBase {
   uint32_t window_left;
   float sm_scale_log2;
   float soft_cap_pre_tanh_scale;
+  uint8_t* maybe_router;
+  uint32_t num_kv_heads;
 
   // Create closure
   template <typename Params>
@@ -62,6 +66,14 @@ struct DefaultAttention : AttentionVariantBase {
       }
     }
     window_left = (params.window_left >= 0) ? params.window_left : kv_len;
+    if constexpr (use_router) {
+      maybe_router = params.maybe_router;
+      if constexpr (has_num_kv_heads_v<Params>) {
+        num_kv_heads = params.num_kv_heads;
+      } else {
+        num_kv_heads = params.paged_kv.num_heads;
+      }
+    }
   }
 
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
@@ -85,8 +97,14 @@ struct DefaultAttention : AttentionVariantBase {
         mask &= ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
       }
     }
-    if constexpr (use_sliding_window) {
+    if constexpr (use_sliding_window && !use_router) {
       mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
+    }
+    if constexpr (use_router) {
+      bool head_uses_swa = maybe_router[batch_idx * num_kv_heads + kv_head_idx];
+      if (head_uses_swa) {
+        mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
+      }
     }
     return mask;
   })
