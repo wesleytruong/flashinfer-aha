@@ -1488,18 +1488,23 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     rope_theta,
                     0,  # token_pos_in_items_len
                     self._workspace_size,
-                    paged_kv_cache,
                     self._num_qo_heads,
                     self._num_kv_heads,
                     self._block_tables,
                     self._kv_lens_buffer,
                     page_size,
+                    1,  # max_q_len for decode
                     self._max_kv_len,
+                    self._batch_size,
+                    self._qo_indptr_buf,
+                    self._paged_kv_indptr_buf,
                     sinks,
                     skip_softmax_threshold_scale_factor,
                 ]
                 if self._use_router:
                     run_args.append(router)
+                    run_args.append(int(router_sink_size))
+                    run_args.append(bool(router_is_aha_gate))
 
             self._cached_module.paged_run(*run_args)
         else:
