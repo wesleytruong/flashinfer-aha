@@ -26,6 +26,9 @@ namespace flashinfer {
 
 DEFINE_HAS_MEMBER(v_scale)
 DEFINE_HAS_MEMBER(maybe_router)
+DEFINE_HAS_MEMBER(router_sink_size)
+DEFINE_HAS_MEMBER(router_is_aha_gate)
+DEFINE_HAS_MEMBER(q_indptr)
 
 #define REGISTER_QUERY_TRANSFORM(params, q, ...)                                    \
   template <typename Params, typename T>                                            \

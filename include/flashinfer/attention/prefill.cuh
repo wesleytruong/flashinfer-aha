@@ -2105,9 +2105,21 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     uint32_t window_left = variant.window_left;
     // Per-head router: full-attention heads use window covering entire sequence
     if constexpr (has_maybe_router_v<Params>) {
-      if (params.maybe_router != nullptr &&
-          !params.maybe_router[request_idx * num_kv_heads + kv_head_idx]) {
-        window_left = kv_len;
+      if (params.maybe_router != nullptr) {
+        bool is_aha_gate = false;
+        if constexpr (has_router_is_aha_gate_v<Params>) {
+          is_aha_gate = params.router_is_aha_gate;
+        }
+        if (is_aha_gate ||
+            !params.maybe_router[request_idx * num_kv_heads + kv_head_idx]) {
+          window_left = kv_len;
+        }
+      }
+    }
+    bool force_logits_mask_every_iter = false;
+    if constexpr (has_maybe_router_v<Params>) {
+      if constexpr (has_router_is_aha_gate_v<Params>) {
+        force_logits_mask_every_iter = params.maybe_router != nullptr && params.router_is_aha_gate;
       }
     }
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
@@ -2317,7 +2329,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                              kv_head_idx);
       } else {
         if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
-          if (iter >= mask_iteration || iter < window_iteration) {
+          if (force_logits_mask_every_iter || iter >= mask_iteration || iter < window_iteration) {
             logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                  kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                                  kv_head_idx);
@@ -2331,7 +2343,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len, tid.x,
                 kv_head_idx);
           } else {
-            if (iter >= mask_iteration || iter < window_iteration) {
+            if (force_logits_mask_every_iter || iter >= mask_iteration || iter < window_iteration) {
               logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                    kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                                    kv_head_idx);

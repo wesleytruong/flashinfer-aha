@@ -261,6 +261,8 @@ def get_batch_decode_module(*args):
             sm_scale: float,
             rope_scale: float,
             rope_theta: float,
+            router_sink_size: int,
+            router_is_aha_gate: bool,
         ) -> None:
             run_func(
                 float_workspace_buffer,
@@ -283,6 +285,8 @@ def get_batch_decode_module(*args):
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta
+                router_sink_size,
+                router_is_aha_gate,
             )
 
         @register_fake_op(f"flashinfer::{uri}_run")
@@ -307,6 +311,8 @@ def get_batch_decode_module(*args):
             sm_scale: float,
             rope_scale: float,
             rope_theta: float,
+            router_sink_size: int,
+            router_is_aha_gate: bool,
         ) -> None:
             pass
 
@@ -1308,6 +1314,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         router: Optional[torch.Tensor] = None,
+        aha_gate: Optional[torch.Tensor] = None,
+        router_sink_size: int = 0,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1362,6 +1370,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
             * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
         """
+        router_is_aha_gate = False
+        if aha_gate is not None:
+            if router is not None:
+                raise ValueError("Pass either router or aha_gate, not both.")
+            router = aha_gate
+            router_is_aha_gate = True
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
@@ -1525,6 +1539,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     rope_scale,
                     rope_theta,
                 ]
+                if self._use_router:
+                    run_args.append(int(router_sink_size))
+                    run_args.append(bool(router_is_aha_gate))
 
             self._cached_module.run(*run_args)
 

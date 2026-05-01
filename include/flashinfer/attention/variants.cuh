@@ -37,10 +37,12 @@ struct DefaultAttention : AttentionVariantBase {
   uint8_t* custom_mask_ptr;
   uint32_t qo_len, kv_len;
   uint32_t window_left;
+  uint32_t router_sink_size;
   float sm_scale_log2;
   float soft_cap_pre_tanh_scale;
   uint8_t* maybe_router;
   uint32_t num_kv_heads;
+  bool router_is_aha_gate;
 
   // Create closure
   template <typename Params>
@@ -66,12 +68,20 @@ struct DefaultAttention : AttentionVariantBase {
       }
     }
     window_left = (params.window_left >= 0) ? params.window_left : kv_len;
+    router_sink_size = 0;
     if constexpr (use_router) {
       maybe_router = params.maybe_router;
+      router_is_aha_gate = false;
       if constexpr (has_num_kv_heads_v<Params>) {
         num_kv_heads = params.num_kv_heads;
       } else {
         num_kv_heads = params.paged_kv.num_heads;
+      }
+      if constexpr (has_router_sink_size_v<Params>) {
+        router_sink_size = params.router_sink_size;
+      }
+      if constexpr (has_router_is_aha_gate_v<Params>) {
+        router_is_aha_gate = params.router_is_aha_gate;
       }
     }
   }
@@ -101,9 +111,22 @@ struct DefaultAttention : AttentionVariantBase {
       mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
     }
     if constexpr (use_router) {
-      bool head_uses_swa = maybe_router[batch_idx * num_kv_heads + kv_head_idx];
-      if (head_uses_swa) {
-        mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
+      bool route_value;
+      if constexpr (has_q_indptr_v<Params>) {
+        if (router_is_aha_gate) {
+          route_value = maybe_router[(params.q_indptr[batch_idx] + qo_idx) * num_kv_heads +
+                                     kv_head_idx];
+        } else {
+          route_value = maybe_router[batch_idx * num_kv_heads + kv_head_idx];
+        }
+      } else {
+        route_value = maybe_router[batch_idx * num_kv_heads + kv_head_idx];
+      }
+      bool head_uses_local = router_is_aha_gate ? !route_value : route_value;
+      if (head_uses_local) {
+        bool in_sink = kv_idx < router_sink_size;
+        bool in_recent = kv_idx + qo_len + window_left >= kv_len + qo_idx;
+        mask &= (in_sink || in_recent);
       }
     }
     return mask;

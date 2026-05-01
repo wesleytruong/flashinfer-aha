@@ -14,10 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from pathlib import Path
+
 import pytest
 import torch
 
 import flashinfer
+from flashinfer.jit import env as jit_env
+
+
+def _wire_editable_checkout() -> None:
+    root = Path(__file__).resolve().parents[2]
+    if (root / "csrc").exists() and (root / "include").exists():
+        jit_env.FLASHINFER_CSRC_DIR = root / "csrc"
+        jit_env.FLASHINFER_INCLUDE_DIR = root / "include"
+        jit_env.CUTLASS_INCLUDE_DIRS = [
+            root / "3rdparty/cutlass/include",
+            root / "3rdparty/cutlass/tools/util/include",
+        ]
+        jit_env.SPDLOG_INCLUDE_DIR = root / "3rdparty/spdlog/include"
+
+
+_wire_editable_checkout()
 
 
 def _make_paged_kv(batch_size, kv_len, num_kv_heads, head_dim, page_size, device="cuda:0"):
@@ -40,6 +58,38 @@ def _make_paged_kv(batch_size, kv_len, num_kv_heads, head_dim, page_size, device
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device=device,
     )
     return k_data, v_data, kv_indptr, kv_indices, kv_last_page_len
+
+
+def _decode_sink_recent_reference(q, k_data, v_data, router, kv_len, window_left, sink_size):
+    """Dense reference for per-KV-head full vs sink+recent decode."""
+    batch_size, num_qo_heads, head_dim = q.shape
+    num_kv_heads = router.shape[1]
+    group_size = num_qo_heads // num_kv_heads
+    pages_per_seq = k_data.shape[0] // batch_size
+    page_size = k_data.shape[1]
+    k_dense = k_data.view(
+        batch_size, pages_per_seq, page_size, num_kv_heads, head_dim
+    ).reshape(batch_size, pages_per_seq * page_size, num_kv_heads, head_dim)[:, :kv_len]
+    v_dense = v_data.view(
+        batch_size, pages_per_seq, page_size, num_kv_heads, head_dim
+    ).reshape(batch_size, pages_per_seq * page_size, num_kv_heads, head_dim)[:, :kv_len]
+
+    out = torch.empty_like(q)
+    pos = torch.arange(kv_len, device=q.device)
+    recent_start = max(0, kv_len - window_left - 1)
+    for b in range(batch_size):
+        for kv_h in range(num_kv_heads):
+            if router[b, kv_h] == 0:
+                mask = torch.ones(kv_len, dtype=torch.bool, device=q.device)
+            else:
+                mask = (pos < sink_size) | (pos >= recent_start)
+            k_sel = k_dense[b, mask, kv_h].float()
+            v_sel = v_dense[b, mask, kv_h].float()
+            for qo_h in range(kv_h * group_size, (kv_h + 1) * group_size):
+                scores = (q[b, qo_h].float() @ k_sel.T) * (head_dim ** -0.5)
+                probs = torch.softmax(scores, dim=-1)
+                out[b, qo_h] = (probs @ v_sel).to(out.dtype)
+    return out
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -192,6 +242,46 @@ def test_batch_decode_router_mixed(
                     o_full[b, qo_start:qo_end].cpu(),
                     rtol=1e-3, atol=1e-3,
                 )
+
+
+def test_batch_decode_router_sink_recent_matches_dense_reference():
+    """router_sink_size turns router-local heads into AHA/Duo sink+recent heads."""
+    torch.manual_seed(7)
+    batch_size = 2
+    kv_len = 97
+    window_left = 17
+    sink_size = 11
+    num_kv_heads = 2
+    num_qo_heads = 4
+    head_dim = 64
+    page_size = 16
+
+    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=torch.float16, device="cuda:0")
+    k_data, v_data, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+        batch_size, kv_len, num_kv_heads, head_dim, page_size,
+    )
+    router = torch.tensor([[1, 0], [0, 1]], dtype=torch.uint8, device="cuda:0")
+    expected = _decode_sink_recent_reference(
+        q, k_data, v_data, router, kv_len, window_left, sink_size,
+    )
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper_router = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", use_router=True,
+    )
+    wrapper_router.plan(
+        kv_indptr, kv_indices, kv_last_page_len,
+        num_qo_heads, num_kv_heads, head_dim, page_size,
+        window_left=window_left,
+    )
+    # AHA-native API: 1 = full, 0 = sink+recent local. This is the inverse
+    # of the legacy router tensor used by the original FlashInfer fork tests.
+    aha_gate = (~router.bool()).to(torch.uint8)
+    actual = wrapper_router.run(
+        q, (k_data, v_data), aha_gate=aha_gate, router_sink_size=sink_size,
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -353,3 +443,101 @@ def test_batch_prefill_router_mixed(
                     o_full[row_start:row_end, qo_start:qo_end].cpu(),
                     rtol=1e-3, atol=1e-3,
                 )
+
+
+def _prefill_aha_sink_recent_reference(
+    q, k_data, v_data, aha_gate, batch_size, qo_len, kv_len, window_left, sink_size
+):
+    """Dense reference for AHA per-token gates in paged prefill."""
+    _, num_qo_heads, head_dim = q.shape
+    num_kv_heads = aha_gate.shape[1]
+    group_size = num_qo_heads // num_kv_heads
+    pages_per_seq = k_data.shape[0] // batch_size
+    page_size = k_data.shape[1]
+    k_dense = k_data.view(
+        batch_size, pages_per_seq, page_size, num_kv_heads, head_dim
+    ).reshape(batch_size, pages_per_seq * page_size, num_kv_heads, head_dim)[:, :kv_len]
+    v_dense = v_data.view(
+        batch_size, pages_per_seq, page_size, num_kv_heads, head_dim
+    ).reshape(batch_size, pages_per_seq * page_size, num_kv_heads, head_dim)[:, :kv_len]
+    gate = aha_gate.view(batch_size, qo_len, num_kv_heads)
+    q_view = q.view(batch_size, qo_len, num_qo_heads, head_dim)
+    out = torch.empty_like(q_view)
+    pos = torch.arange(kv_len, device=q.device)
+
+    for b in range(batch_size):
+        for qi in range(qo_len):
+            q_abs = kv_len - qo_len + qi
+            causal = pos <= q_abs
+            recent = (q_abs - pos) <= window_left
+            sink = pos < sink_size
+            for kv_h in range(num_kv_heads):
+                if gate[b, qi, kv_h] != 0:
+                    mask = causal
+                else:
+                    mask = causal & (sink | recent)
+                k_sel = k_dense[b, mask, kv_h].float()
+                v_sel = v_dense[b, mask, kv_h].float()
+                for qo_h in range(kv_h * group_size, (kv_h + 1) * group_size):
+                    scores = (q_view[b, qi, qo_h].float() @ k_sel.T) * (head_dim ** -0.5)
+                    probs = torch.softmax(scores, dim=-1)
+                    out[b, qi, qo_h] = (probs @ v_sel).to(out.dtype)
+    return out.reshape(batch_size * qo_len, num_qo_heads, head_dim)
+
+
+@pytest.mark.parametrize("gate_mode", ["all0", "all1", "random"])
+def test_batch_prefill_aha_token_router_sink_recent_matches_dense_reference(gate_mode):
+    """AHA prefill uses per-token gates: 1 = full, 0 = sink+recent local."""
+    torch.manual_seed(11)
+    batch_size = 1
+    qo_len = 128
+    kv_len = 128
+    window_left = 31
+    sink_size = 8
+    num_kv_heads = 8
+    num_qo_heads = 16
+    head_dim = 128
+    page_size = 16
+
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim,
+        dtype=torch.float16, device="cuda:0",
+    )
+    k_data, v_data, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+        batch_size, kv_len, num_kv_heads, head_dim, page_size,
+    )
+    qo_indptr = torch.arange(
+        0, batch_size + 1, device="cuda:0", dtype=torch.int32
+    ) * qo_len
+    if gate_mode == "all0":
+        aha_gate = torch.zeros(
+            batch_size * qo_len, num_kv_heads, dtype=torch.uint8, device="cuda:0",
+        )
+    elif gate_mode == "all1":
+        aha_gate = torch.ones(
+            batch_size * qo_len, num_kv_heads, dtype=torch.uint8, device="cuda:0",
+        )
+    else:
+        aha_gate = (
+            torch.rand(batch_size * qo_len, num_kv_heads, device="cuda:0") < 0.5
+        ).to(torch.uint8)
+
+    expected = _prefill_aha_sink_recent_reference(
+        q, k_data, v_data, aha_gate, batch_size, qo_len, kv_len, window_left, sink_size,
+    )
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", use_router=True, backend="fa2",
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
+        num_qo_heads, num_kv_heads, head_dim, page_size,
+        causal=True, window_left=window_left,
+    )
+    actual = wrapper.run(
+        q, (k_data, v_data), router=aha_gate,
+        router_sink_size=sink_size, router_is_aha_gate=True,
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=2e-3, atol=2e-2)

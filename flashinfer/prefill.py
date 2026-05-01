@@ -460,6 +460,8 @@ def get_batch_prefill_module(backend, *args):
         scale_k: Optional[torch.Tensor] = None,
         scale_v: Optional[torch.Tensor] = None,
         maybe_router: Optional[torch.Tensor] = None,
+        router_sink_size: int = 0,
+        router_is_aha_gate: bool = False,
     ) -> None:
         # Check if FP8 by presence of scale tensors
         is_fp8 = scale_q is not None
@@ -496,6 +498,9 @@ def get_batch_prefill_module(backend, *args):
                 1.0 / rope_theta,  # rope_rcp_theta,
                 token_pos_in_items_len,
             ]
+            if _use_router:
+                fa2_args.append(router_sink_size)
+                fa2_args.append(router_is_aha_gate)
             ragged_run_func(*fa2_args)
         elif is_fp8:
             # FA3 FP8: scale_q, scale_k, scale_v, sm_scale, scale_q_scalar, scale_k_scalar, scale_v_scalar
@@ -587,6 +592,8 @@ def get_batch_prefill_module(backend, *args):
         scale_k: Optional[torch.Tensor] = None,
         scale_v: Optional[torch.Tensor] = None,
         maybe_router: Optional[torch.Tensor] = None,
+        router_sink_size: int = 0,
+        router_is_aha_gate: bool = False,
     ) -> None:
         pass
 
@@ -648,6 +655,8 @@ def get_batch_prefill_module(backend, *args):
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         maybe_router: Optional[torch.Tensor] = None,
+        router_sink_size: int = 0,
+        router_is_aha_gate: bool = False,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -718,6 +727,9 @@ def get_batch_prefill_module(backend, *args):
                 1.0 / rope_theta,  # rope_rcp_theta
                 token_pos_in_items_len,
             ]
+            if _use_router:
+                fa2_args.append(router_sink_size)
+                fa2_args.append(router_is_aha_gate)
             paged_run_func(*fa2_args)
         else:
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
@@ -824,6 +836,8 @@ def get_batch_prefill_module(backend, *args):
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         maybe_router: Optional[torch.Tensor] = None,
+        router_sink_size: int = 0,
+        router_is_aha_gate: bool = False,
     ) -> None:
         pass
 
@@ -2077,6 +2091,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         router: Optional[torch.Tensor] = None,
+        router_sink_size: int = 0,
+        router_is_aha_gate: bool = False,
     ) -> torch.Tensor: ...
 
     @overload
@@ -2095,6 +2111,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         router: Optional[torch.Tensor] = None,
+        router_sink_size: int = 0,
+        router_is_aha_gate: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -2114,6 +2132,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         router: Optional[torch.Tensor] = None,
+        router_sink_size: int = 0,
+        router_is_aha_gate: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -2153,8 +2173,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         router : Optional[torch.Tensor]
-            The per-head router tensor, shape: ``[batch_size, num_kv_heads]``, dtype: ``torch.uint8``.
-            0 = full attention, 1 = sliding window attention. Requires ``use_router=True`` on the wrapper.
+            The router tensor, dtype: ``torch.uint8``. By default its shape is
+            ``[batch_size, num_kv_heads]`` with 0 = full attention and
+            1 = sliding window attention. If ``router_is_aha_gate=True``, its
+            shape is ``[qo_indptr[-1], num_kv_heads]`` with 1 = full attention
+            and 0 = sink+sliding-window attention. Requires
+            ``use_router=True`` on the wrapper.
+        router_sink_size : int
+            Number of sink tokens used by the local router path.
+        router_is_aha_gate : bool
+            Interpret ``router`` as AHA per-token gates.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2335,6 +2363,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 ]
                 if self._use_router:
                     run_args.append(router)
+                    run_args.append(int(router_sink_size))
+                    run_args.append(bool(router_is_aha_gate))
 
             assert self._cached_module is not None, "cached module is not initialized"
             self._cached_module.paged_run(*run_args)
