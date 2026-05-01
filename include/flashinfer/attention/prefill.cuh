@@ -2169,6 +2169,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     bool router_aha_q_tile_all_full = false;
     uint32_t router_aha_sink_size = 0;
     uint32_t router_aha_recent_start = 0;
+    uint32_t router_aha_recent_full_start = 0;
     if constexpr (has_maybe_router_v<Params>) {
       if constexpr (has_router_is_aha_gate_v<Params>) {
         if (params.maybe_router != nullptr && params.router_is_aha_gate) {
@@ -2194,6 +2195,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
             }
             router_aha_recent_start = sub_if_greater_or_zero(
                 kv_len + q_tile_start, qo_len + router_window_left);
+            const uint32_t q_tile_last = qo_upper_bound > 0 ? qo_upper_bound - 1 : q_tile_start;
+            router_aha_recent_full_start = sub_if_greater_or_zero(
+                kv_len + q_tile_last, qo_len + router_window_left);
+            if (router_aha_sink_size == 0) {
+              window_left = router_window_left;
+            }
           }
         }
       }
@@ -2203,7 +2210,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       if constexpr (has_router_is_aha_gate_v<Params>) {
         force_logits_mask_every_iter =
             params.maybe_router != nullptr && params.router_is_aha_gate &&
-            !router_aha_q_tile_all_full;
+            !router_aha_q_tile_all_full &&
+            !(router_aha_q_tile_all_local && router_aha_sink_size == 0);
       }
     }
 
@@ -2444,16 +2452,25 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                kv_head_idx);
         } else {
           if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
-            if (force_logits_mask_every_iter || iter >= mask_iteration || iter < window_iteration) {
-              if (router_aha_q_tile_all_local) {
+            const bool base_mask_needed = iter >= mask_iteration || iter < window_iteration;
+            if (router_aha_q_tile_all_local) {
+              bool local_mask_needed = false;
+              if (router_aha_sink_size != 0) {
+                const bool local_tile_fully_valid =
+                    (tile_end <= router_aha_sink_size) ||
+                    (tile_start >= router_aha_recent_full_start) ||
+                    (router_aha_sink_size >= router_aha_recent_full_start);
+                local_mask_needed = !local_tile_fully_valid;
+              }
+              if (base_mask_needed || local_mask_needed) {
                 logits_mask_aha_local_tile<KTraits>(
                     qo_packed_idx_base, kv_idx_base, qo_len, kv_len, chunk_end, router_window_left,
                     router_aha_sink_size, group_size, s_frag, tid);
-              } else {
-                logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                     kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                                     kv_head_idx);
               }
+            } else if (force_logits_mask_every_iter || base_mask_needed) {
+              logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                   kv_head_idx);
             }
           } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
             if (iter + 1 >= num_iterations_prefix) {
