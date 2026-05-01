@@ -2174,21 +2174,21 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       if constexpr (has_router_is_aha_gate_v<Params>) {
         if (params.maybe_router != nullptr && params.router_is_aha_gate) {
           const uint32_t q_tile_start = (qo_tile_idx * CTA_TILE_Q) / group_size;
-          router_aha_q_tile_all_local = q_tile_start < qo_upper_bound;
-          router_aha_q_tile_all_full = q_tile_start < qo_upper_bound;
-          for (uint32_t q_idx = q_tile_start; q_idx < qo_upper_bound; ++q_idx) {
+          bool lane_q_tile_all_local = q_tile_start < qo_upper_bound;
+          bool lane_q_tile_all_full = q_tile_start < qo_upper_bound;
+          for (uint32_t q_idx = q_tile_start + lane_idx; q_idx < qo_upper_bound;
+               q_idx += WARP_SIZE) {
             const uint8_t route_value =
                 params.maybe_router[(q_indptr[request_idx] + q_idx) * num_kv_heads +
                                     kv_head_idx];
             if (route_value != static_cast<uint8_t>(0)) {
-              router_aha_q_tile_all_local = false;
+              lane_q_tile_all_local = false;
             } else {
-              router_aha_q_tile_all_full = false;
-            }
-            if (!router_aha_q_tile_all_local && !router_aha_q_tile_all_full) {
-              break;
+              lane_q_tile_all_full = false;
             }
           }
+          router_aha_q_tile_all_local = __all_sync(0xffffffff, lane_q_tile_all_local);
+          router_aha_q_tile_all_full = __all_sync(0xffffffff, lane_q_tile_all_full);
           if (router_aha_q_tile_all_local) {
             if constexpr (has_router_sink_size_v<Params>) {
               router_aha_sink_size = min((uint32_t)params.router_sink_size, kv_len);
