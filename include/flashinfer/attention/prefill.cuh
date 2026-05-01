@@ -2161,17 +2161,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         }
       }
     }
-    bool force_logits_mask_every_iter = false;
-    if constexpr (has_maybe_router_v<Params>) {
-      if constexpr (has_router_is_aha_gate_v<Params>) {
-        force_logits_mask_every_iter = params.maybe_router != nullptr && params.router_is_aha_gate;
-      }
-    }
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
 
     bool router_aha_q_tile_all_local = false;
+    bool router_aha_q_tile_all_full = false;
     uint32_t router_aha_sink_size = 0;
     uint32_t router_aha_recent_start = 0;
     if constexpr (has_maybe_router_v<Params>) {
@@ -2179,10 +2174,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         if (params.maybe_router != nullptr && params.router_is_aha_gate) {
           const uint32_t q_tile_start = (qo_tile_idx * CTA_TILE_Q) / group_size;
           router_aha_q_tile_all_local = q_tile_start < qo_upper_bound;
+          router_aha_q_tile_all_full = q_tile_start < qo_upper_bound;
           for (uint32_t q_idx = q_tile_start; q_idx < qo_upper_bound; ++q_idx) {
-            if (params.maybe_router[(q_indptr[request_idx] + q_idx) * num_kv_heads +
-                                    kv_head_idx] != static_cast<uint8_t>(0)) {
+            const uint8_t route_value =
+                params.maybe_router[(q_indptr[request_idx] + q_idx) * num_kv_heads +
+                                    kv_head_idx];
+            if (route_value != static_cast<uint8_t>(0)) {
               router_aha_q_tile_all_local = false;
+            } else {
+              router_aha_q_tile_all_full = false;
+            }
+            if (!router_aha_q_tile_all_local && !router_aha_q_tile_all_full) {
               break;
             }
           }
@@ -2194,6 +2196,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 kv_len + q_tile_start, qo_len + router_window_left);
           }
         }
+      }
+    }
+    bool force_logits_mask_every_iter = false;
+    if constexpr (has_maybe_router_v<Params>) {
+      if constexpr (has_router_is_aha_gate_v<Params>) {
+        force_logits_mask_every_iter =
+            params.maybe_router != nullptr && params.router_is_aha_gate &&
+            !router_aha_q_tile_all_full;
       }
     }
 
