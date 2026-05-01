@@ -329,7 +329,8 @@ __device__ __forceinline__ void page_produce_kv(typename KTraits::SharedStorage*
                                                 const uint32_t kv_idx_base,
                                                 const size_t* thr_local_kv_offset,
                                                 const uint32_t kv_len, const uint32_t warp_idx,
-                                                const uint32_t lane_idx) {
+                                                const uint32_t lane_idx,
+                                                const bool tile_valid = true) {
   // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
   smem_t<KTraits::SWIZZLE_MODE_KV> smem(produce_v ? smem_storage->v_smem : smem_storage->k_smem);
   using DType = typename KTraits::DTypeKV;
@@ -351,7 +352,7 @@ __device__ __forceinline__ void page_produce_kv(typename KTraits::SharedStorage*
       DType* gptr = kv_ptr + thr_local_kv_offset[i];
 #pragma unroll
       for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DType)); ++j) {
-        smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+        smem.load_128b_async<fill_mode>(*smem_offset, gptr, tile_valid && kv_idx < kv_len);
         *smem_offset = smem.template advance_offset_by_column<8>(*smem_offset, j);
         gptr += 8 * upcast_size<DType>();
       }
@@ -368,7 +369,7 @@ __device__ __forceinline__ void page_produce_kv(typename KTraits::SharedStorage*
 #pragma unroll
     for (uint32_t i = 0; i < NUM_MMA_KV * 2 / NUM_WARPS_Q; ++i) {
       DType* gptr = kv_ptr + thr_local_kv_offset[i];
-      smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+      smem.load_128b_async<fill_mode>(*smem_offset, gptr, tile_valid && kv_idx < kv_len);
       kv_idx += NUM_WARPS * 8;
       *smem_offset =
           smem.template advance_offset_by_row<NUM_WARPS * 8, UPCAST_STRIDE>(*smem_offset);
@@ -2103,6 +2104,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len;
     uint32_t window_left = variant.window_left;
+    const uint32_t router_window_left = window_left;
     // Per-head router: full-attention heads use window covering entire sequence
     if constexpr (has_maybe_router_v<Params>) {
       if (params.maybe_router != nullptr) {
@@ -2125,6 +2127,32 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
+
+    bool router_aha_q_tile_all_local = false;
+    uint32_t router_aha_sink_size = 0;
+    uint32_t router_aha_recent_start = 0;
+    if constexpr (has_maybe_router_v<Params>) {
+      if constexpr (has_router_is_aha_gate_v<Params>) {
+        if (params.maybe_router != nullptr && params.router_is_aha_gate) {
+          const uint32_t q_tile_start = (qo_tile_idx * CTA_TILE_Q) / group_size;
+          router_aha_q_tile_all_local = q_tile_start < qo_upper_bound;
+          for (uint32_t q_idx = q_tile_start; q_idx < qo_upper_bound; ++q_idx) {
+            if (params.maybe_router[(q_indptr[request_idx] + q_idx) * num_kv_heads +
+                                    kv_head_idx] != static_cast<uint8_t>(0)) {
+              router_aha_q_tile_all_local = false;
+              break;
+            }
+          }
+          if (router_aha_q_tile_all_local) {
+            if constexpr (has_router_sink_size_v<Params>) {
+              router_aha_sink_size = min((uint32_t)params.router_sink_size, kv_len);
+            }
+            router_aha_recent_start = sub_if_greater_or_zero(
+                kv_len + q_tile_start, qo_len + router_window_left);
+          }
+        }
+      }
+    }
 
     const uint32_t kv_start_idx = sub_if_greater_or_zero(
         kv_len + (qo_tile_idx * CTA_TILE_Q) / group_size, qo_len + window_left);
@@ -2220,11 +2248,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           page_iter, kv_head_idx, entry_idx,
           (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>(), last_indptr);
     }
+    const uint32_t first_tile_end = min(chunk_start + CTA_TILE_KV, chunk_end);
+    const bool first_router_tile_valid =
+        !router_aha_q_tile_all_local || chunk_start < router_aha_sink_size ||
+        first_tile_end > router_aha_recent_start;
     page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data, 0,
-                                    thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
+                                    thr_local_kv_offset, chunk_size, warp_idx, lane_idx,
+                                    first_router_tile_valid);
     cp_async::commit_group();
     page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data, 0,
-                                   thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
+                                   thr_local_kv_offset, chunk_size, warp_idx, lane_idx,
+                                   first_router_tile_valid);
     cp_async::commit_group();
 
     uint32_t num_iterations_prefix;
@@ -2307,69 +2341,86 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       cp_async::wait_group<1>();
       block.sync();
 
+      const uint32_t tile_start = chunk_start + iter * CTA_TILE_KV;
+      const uint32_t tile_end = min(tile_start + CTA_TILE_KV, chunk_end);
+      const bool router_tile_valid =
+          !router_aha_q_tile_all_local || tile_start < router_aha_sink_size ||
+          tile_end > router_aha_recent_start;
+
       if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-        k_smem_inplace_apply_rotary<KTraits>(
-            (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[request_idx]) +
-                chunk_start + iter * CTA_TILE_KV,
-            &k_smem, &k_smem_offset_r, rope_freq, tid);
+        if (router_tile_valid) {
+          k_smem_inplace_apply_rotary<KTraits>(
+              (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[request_idx]) +
+                  tile_start,
+              &k_smem, &k_smem_offset_r, rope_freq, tid);
+        }
         block.sync();
       }
 
-      // compute attention score
-      compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-      uint32_t kv_idx_base =
-          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
-      logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
+      if (router_tile_valid) {
+        // compute attention score
+        compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
+        uint32_t kv_idx_base =
+            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+        logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                  kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
-      // apply mask
-      if (MASK_MODE == MaskMode::kCustom) {
-        logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                             kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                             kv_head_idx);
-      } else {
-        if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
-          if (force_logits_mask_every_iter || iter >= mask_iteration || iter < window_iteration) {
-            logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                 kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                                 kv_head_idx);
-          }
-        } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
-          if (iter + 1 >= num_iterations_prefix) {
-            logits_mask_multi_item_scoring<KTraits>(
-                params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base, kv_idx_base, qo_len,
-                kv_len, window_left, chunk_end, group_size, s_frag,
-                __ldg(maybe_prefix_len_ptr + request_idx),
-                maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len, tid.x,
-                kv_head_idx);
-          } else {
+        // apply mask
+        if (MASK_MODE == MaskMode::kCustom) {
+          logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                               kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                               kv_head_idx);
+        } else {
+          if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
             if (force_logits_mask_every_iter || iter >= mask_iteration || iter < window_iteration) {
               logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                    kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                                    kv_head_idx);
             }
+          } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
+            if (iter + 1 >= num_iterations_prefix) {
+              logits_mask_multi_item_scoring<KTraits>(
+                  params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base, kv_idx_base, qo_len,
+                  kv_len, window_left, chunk_end, group_size, s_frag,
+                  __ldg(maybe_prefix_len_ptr + request_idx),
+                  maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len, tid.x,
+                  kv_head_idx);
+            } else {
+              if (force_logits_mask_every_iter || iter >= mask_iteration || iter < window_iteration) {
+                logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                     kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                     kv_head_idx);
+              }
+            }
           }
         }
+
+        // compute m,d states in online softmax
+        update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
       }
 
-      // compute m,d states in online softmax
-      update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
-
       block.sync();
+      const uint32_t next_tile_start = chunk_start + (iter + 1) * CTA_TILE_KV;
+      const uint32_t next_tile_end = min(next_tile_start + CTA_TILE_KV, chunk_end);
+      const bool next_router_tile_valid =
+          !router_aha_q_tile_all_local || next_tile_start < router_aha_sink_size ||
+          next_tile_end > router_aha_recent_start;
       page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
                                       (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
-                                      warp_idx, lane_idx);
+                                      warp_idx, lane_idx, next_router_tile_valid);
       cp_async::commit_group();
       cp_async::wait_group<1>();
       block.sync();
 
       // compute sfm*v
-      compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+      if (router_tile_valid) {
+        compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+      }
 
       block.sync();
       page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
                                      (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
-                                     warp_idx, lane_idx);
+                                     warp_idx, lane_idx, next_router_tile_valid);
       cp_async::commit_group();
     }
     cp_async::wait_group<0>();
