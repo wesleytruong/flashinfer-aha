@@ -792,6 +792,49 @@ __device__ __forceinline__ void logits_mask(
   }
 }
 
+template <typename KTraits>
+__device__ __forceinline__ void logits_mask_aha_local_tile(
+    const uint32_t qo_packed_idx_base, const uint32_t kv_idx_base, const uint32_t qo_len,
+    const uint32_t kv_len, const uint32_t chunk_end, const uint32_t window_left,
+    const uint32_t router_sink_size, const uint_fastdiv group_size,
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8], const dim3 tid = threadIdx) {
+  const uint32_t lane_idx = tid.x;
+  constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
+  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
+  constexpr MaskMode MASK_MODE = KTraits::MASK_MODE;
+  uint32_t q[NUM_MMA_Q][2], r[NUM_MMA_Q][2];
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      group_size.divmod(qo_packed_idx_base + mma_q * 16 + lane_idx / 4 + 8 * j, q[mma_q][j],
+                        r[mma_q][j]);
+    }
+  }
+
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
+#pragma unroll
+      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+        const uint32_t q_idx = q[mma_q][(reg_id % 4) / 2], kv_idx = kv_idx_base + mma_kv * 16 +
+                                                                    2 * (lane_idx % 4) +
+                                                                    8 * (reg_id / 4) + reg_id % 2;
+        const bool base_mask =
+            !(MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
+                  ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
+                  : kv_idx >= chunk_end);
+        const bool local_mask =
+            kv_idx < router_sink_size || kv_idx + qo_len + window_left >= kv_len + q_idx;
+        const bool mask = base_mask && local_mask;
+        s_frag[mma_q][mma_kv][reg_id] =
+            (mask) ? s_frag[mma_q][mma_kv][reg_id] : (KTraits::MaskFillValue);
+      }
+    }
+  }
+}
+
 template <typename KTraits, typename Params>
 __device__ __forceinline__ void logits_mask_multi_item_scoring(
     const Params& params, typename KTraits::AttentionVariant variant, const uint32_t batch_idx,
@@ -2392,9 +2435,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         } else {
           if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
             if (force_logits_mask_every_iter || iter >= mask_iteration || iter < window_iteration) {
-              logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                                   kv_head_idx);
+              if (router_aha_q_tile_all_local) {
+                logits_mask_aha_local_tile<KTraits>(
+                    qo_packed_idx_base, kv_idx_base, qo_len, kv_len, chunk_end, router_window_left,
+                    router_aha_sink_size, group_size, s_frag, tid);
+              } else {
+                logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                     kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                     kv_head_idx);
+              }
             }
           } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
             if (iter + 1 >= num_iterations_prefix) {
@@ -2406,9 +2455,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                   kv_head_idx);
             } else {
               if (force_logits_mask_every_iter || iter >= mask_iteration || iter < window_iteration) {
-                logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                     kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                                     kv_head_idx);
+                if (router_aha_q_tile_all_local) {
+                  logits_mask_aha_local_tile<KTraits>(
+                      qo_packed_idx_base, kv_idx_base, qo_len, kv_len, chunk_end, router_window_left,
+                      router_aha_sink_size, group_size, s_frag, tid);
+                } else {
+                  logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                       kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag,
+                                       tid, kv_head_idx);
+                }
               }
             }
           }
