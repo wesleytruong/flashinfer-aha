@@ -2162,6 +2162,19 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const uint32_t chunk_end =
         partition_kv ? min((kv_tile_idx + 1) * max_chunk_size + kv_start_idx, kv_len) : kv_len;
     const uint32_t chunk_size = chunk_end - chunk_start;
+    uint32_t router_aha_prefix_iterations = 0;
+    uint32_t router_aha_recent_iteration = 0;
+    if (router_aha_q_tile_all_local) {
+      router_aha_prefix_iterations =
+          ceil_div(sub_if_greater_or_zero(min(router_aha_sink_size, chunk_end), chunk_start),
+                   CTA_TILE_KV);
+      router_aha_recent_iteration =
+          (router_aha_recent_start <= chunk_start)
+              ? 0
+              : min(ceil_div(router_aha_recent_start - chunk_start + 1, CTA_TILE_KV) - 1,
+                    ceil_div(chunk_size, CTA_TILE_KV));
+      router_aha_recent_iteration = max(router_aha_recent_iteration, router_aha_prefix_iterations);
+    }
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
     DTypeQKAccum m[NUM_MMA_Q][2];
@@ -2316,15 +2329,21 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         CTA_TILE_KV;
 
 #pragma unroll 1
-    for (uint32_t iter = 0; iter < num_iterations;
-         iter = (MASK_MODE == MaskMode::kMultiItemScoring)
-                    ? ((iter + 1 == num_iterations_prefix) ? num_iterations_mask : (iter + 1))
-                    : (iter + 1)) {
-      const uint32_t prefetch_skip_step =
-          (MASK_MODE == MaskMode::kMultiItemScoring)
-              ? ((iter + 1 == num_iterations_prefix) ? (num_iterations_mask - num_iterations_prefix)
-                                                     : 0)
-              : 0;
+    for (uint32_t iter = 0; iter < num_iterations;) {
+      uint32_t next_iter = iter + 1;
+      uint32_t prefetch_skip_step = 0;
+      if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
+        if (iter + 1 == num_iterations_prefix) {
+          next_iter = num_iterations_mask;
+          prefetch_skip_step = num_iterations_mask - num_iterations_prefix;
+        }
+      } else {
+        if (router_aha_q_tile_all_local && next_iter >= router_aha_prefix_iterations &&
+            next_iter < router_aha_recent_iteration) {
+          prefetch_skip_step = router_aha_recent_iteration - next_iter;
+          next_iter = router_aha_recent_iteration;
+        }
+      }
       packed_page_iter_base += (1 + prefetch_skip_step) * CTA_TILE_KV;
 #pragma unroll
       for (uint32_t i = 0;
@@ -2400,13 +2419,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       }
 
       block.sync();
-      const uint32_t next_tile_start = chunk_start + (iter + 1) * CTA_TILE_KV;
+      const uint32_t next_tile_start = chunk_start + next_iter * CTA_TILE_KV;
       const uint32_t next_tile_end = min(next_tile_start + CTA_TILE_KV, chunk_end);
       const bool next_router_tile_valid =
           !router_aha_q_tile_all_local || next_tile_start < router_aha_sink_size ||
           next_tile_end > router_aha_recent_start;
       page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
-                                      (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
+                                      next_iter * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
                                       warp_idx, lane_idx, next_router_tile_valid);
       cp_async::commit_group();
       cp_async::wait_group<1>();
@@ -2419,9 +2438,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
       block.sync();
       page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
-                                     (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
+                                     next_iter * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
                                      warp_idx, lane_idx, next_router_tile_valid);
       cp_async::commit_group();
+      iter = next_iter;
     }
     cp_async::wait_group<0>();
     block.sync();
