@@ -122,6 +122,8 @@ struct BatchDecodeParams {
   uint32_t num_qo_heads;
   IdType q_stride_n;
   IdType q_stride_h;
+  IdType o_stride_n;
+  IdType o_stride_h;
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
@@ -146,6 +148,8 @@ struct BatchDecodeParams {
         num_qo_heads(0),
         q_stride_n(0),
         q_stride_h(0),
+        o_stride_n(0),
+        o_stride_h(0),
         window_left(0),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
@@ -174,6 +178,8 @@ struct BatchDecodeParams {
         num_qo_heads(num_qo_heads),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),
+        o_stride_n(num_qo_heads * paged_kv.head_dim),
+        o_stride_h(paged_kv.head_dim),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),

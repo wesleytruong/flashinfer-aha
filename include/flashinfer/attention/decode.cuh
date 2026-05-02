@@ -419,6 +419,8 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   const bool* block_valid_mask = params.block_valid_mask;
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
+  const uint32_t o_stride_n = params.o_stride_n;
+  const uint32_t o_stride_h = params.o_stride_h;
   const bool partition_kv = params.partition_kv;
 
   constexpr uint32_t head_dim = bdx * vec_size;
@@ -495,7 +497,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     if constexpr (!AttentionVariant::use_aha_router) {
       state_t<vec_size> st;
       if (tz == 0) {
-        st.o.cast_store(o + (bx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+        st.o.cast_store(o + bx * o_stride_n + qo_head_idx * o_stride_h + tx * vec_size);
         if (lse != nullptr) {
           lse[bx * num_qo_heads + qo_head_idx] = st.get_lse();
         }
@@ -704,7 +706,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   }
 
   if (tz == 0) {
-    st.o.cast_store(o + (bx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+    st.o.cast_store(o + bx * o_stride_n + qo_head_idx * o_stride_h + tx * vec_size);
     // write lse
     if (lse != nullptr) {
       lse[bx * num_qo_heads + qo_head_idx] = st.get_lse();
@@ -908,8 +910,12 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
         params.partition_kv = true;
         auto o = params.o;
         auto lse = params.lse;
+        auto o_stride_n = params.o_stride_n;
+        auto o_stride_h = params.o_stride_h;
         params.o = tmp_v;
         params.lse = tmp_s;
+        params.o_stride_n = num_qo_heads * HEAD_DIM;
+        params.o_stride_h = HEAD_DIM;
         if (enable_pdl) {
           FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
         } else {
@@ -924,7 +930,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
             if (params.maybe_router != nullptr) {
               FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStridedAhaDecodeRouter(
                   tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr,
-                  num_qo_heads, HEAD_DIM, num_qo_heads * HEAD_DIM, HEAD_DIM, params.maybe_router,
+                  num_qo_heads, HEAD_DIM, o_stride_n, o_stride_h, params.maybe_router,
                   params.router_stride_n, params.router_stride_h, params.paged_kv.indptr,
                   params.paged_kv.last_page_len, params.paged_kv.page_size,
                   params.kv_chunk_size_ptr, num_qo_heads / num_kv_heads, params.window_left,

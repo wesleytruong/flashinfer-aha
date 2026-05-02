@@ -125,6 +125,8 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
   // get q_stride_n and q_stride_h
   const auto q_stride_n = q.stride(0);
   const auto q_stride_h = q.stride(1);
+  const auto o_stride_n = o.stride(0);
+  const auto o_stride_h = o.stride(1);
 
   // get kv_cache_strides
   const int64_t* kv_cache_strides = nullptr;
@@ -160,6 +162,8 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
         params.num_qo_heads = num_qo_heads;
         params.q_stride_n = q_stride_n;
         params.q_stride_h = q_stride_h;
+        params.o_stride_n = o_stride_n;
+        params.o_stride_h = o_stride_h;
         params.window_left = window_left;
         params.request_indices = nullptr;
         params.kv_tile_indices = nullptr;

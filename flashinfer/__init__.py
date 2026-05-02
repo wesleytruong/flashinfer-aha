@@ -21,6 +21,7 @@ from .version import __version__ as __version__
 from .version import __git_version__ as __git_version__
 
 AHA_BATCH_PREFILL_STRIDED_OUTPUT = True
+AHA_BATCH_DECODE_STRIDED_OUTPUT = True
 AHA_ROUTER_STRIDED = True
 AHA_ROUTER_SPECIALIZED = True
 
