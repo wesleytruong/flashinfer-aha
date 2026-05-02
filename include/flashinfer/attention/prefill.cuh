@@ -3080,8 +3080,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                 final_o_stride_h, aha_router_ptr, router_stride_n, router_stride_h,
                 params.paged_kv.indptr, params.paged_kv.last_page_len,
                 static_cast<uint32_t>(params.paged_kv.page_size), params.kv_chunk_size_ptr,
-                num_qo_heads / num_kv_heads, params.window_left, router_sink_size, enable_pdl,
-                stream));
+                num_qo_heads / num_kv_heads, params.window_left, router_sink_size,
+                /*compact_local_chunks=*/true, enable_pdl, stream));
           } else if (use_aha_router_merge && MASK_MODE == MaskMode::kCausal) {
             FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStridedAhaPrefillRouter(
                 tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,

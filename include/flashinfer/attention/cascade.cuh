@@ -476,7 +476,7 @@ __global__ void PersistentVariableLengthMergeStatesAhaDecodeRouterKernel(
     const IdType* __restrict__ kv_indptr, const IdType* __restrict__ kv_last_page_len,
     uint32_t page_size,
     const IdType* __restrict__ kv_chunk_size_ptr, uint32_t group_size, int32_t window_left,
-    uint32_t router_sink_size) {
+    uint32_t router_sink_size, bool compact_local_chunks) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t cta_id = blockIdx.x;
   uint32_t num_ctas = gridDim.x;
@@ -519,7 +519,7 @@ __global__ void PersistentVariableLengthMergeStatesAhaDecodeRouterKernel(
           window_left < 0 ? kv_len : static_cast<uint32_t>(window_left) + 1;
       const uint32_t sink_size = min(router_sink_size, kv_len);
       const uint32_t recent_start = sub_if_greater_or_zero(kv_len, local_window);
-      if (sink_size == 0) {
+      if (sink_size == 0 && compact_local_chunks) {
         // The AHA tensor-core decode path runs through the batch-prefill
         // partition-kv kernel. For pure-local heads it computes the recent
         // window as a compact range starting at partial chunk 0, so the merge
@@ -1080,7 +1080,7 @@ cudaError_t VariableLengthMergeStatesStridedAhaDecodeRouter(
     uint32_t o_stride_n, uint32_t o_stride_h, const uint8_t* router, uint64_t router_stride_n,
     uint64_t router_stride_h, const IdType* kv_indptr, const IdType* kv_last_page_len,
     uint32_t page_size, const IdType* kv_chunk_size_ptr, uint32_t group_size,
-    int32_t window_left, uint32_t router_sink_size, bool enable_pdl,
+    int32_t window_left, uint32_t router_sink_size, bool compact_local_chunks, bool enable_pdl,
     cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
@@ -1123,7 +1123,8 @@ cudaError_t VariableLengthMergeStatesStridedAhaDecodeRouter(
                     &kv_chunk_size_ptr,
                     &group_size,
                     &window_left,
-                    &router_sink_size};
+                    &router_sink_size,
+                    &compact_local_chunks};
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -1141,7 +1142,8 @@ cudaError_t VariableLengthMergeStatesStridedAhaDecodeRouter(
       FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
           &config, kernel, v, s, indptr, v_merged, s_merged, max_seq_len, seq_len, num_heads,
           o_stride_n, o_stride_h, router, router_stride_n, router_stride_h, kv_indptr,
-          kv_last_page_len, page_size, kv_chunk_size_ptr, group_size, window_left, router_sink_size));
+          kv_last_page_len, page_size, kv_chunk_size_ptr, group_size, window_left,
+          router_sink_size, compact_local_chunks));
     } else {
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
     }

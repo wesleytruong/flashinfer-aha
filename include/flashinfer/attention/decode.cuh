@@ -934,7 +934,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
                   params.router_stride_n, params.router_stride_h, params.paged_kv.indptr,
                   params.paged_kv.last_page_len, params.paged_kv.page_size,
                   params.kv_chunk_size_ptr, num_qo_heads / num_kv_heads, params.window_left,
-                  params.router_sink_size, enable_pdl, stream));
+                  params.router_sink_size, /*compact_local_chunks=*/false, enable_pdl, stream));
             } else {
               FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
                   tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr,
