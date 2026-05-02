@@ -1483,6 +1483,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
         use_router: bool = False,
+        use_aha_router: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -1560,7 +1561,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._jit_module = None
 
         self._kv_layout = kv_layout
-        self._use_router = use_router
+        self._use_router = use_router or use_aha_router
+        self._use_aha_router = use_aha_router
         if backend == "cudnn":
             assert kv_layout == "NHD", "CUDNN backend only supports NHD layout"
 
@@ -1979,6 +1981,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     use_fp16_qk_reduction,
                     self._use_router,
+                    self._use_aha_router,
                 )
 
                 self._cached_module = get_batch_prefill_module(

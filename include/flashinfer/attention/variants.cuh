@@ -30,9 +30,10 @@ DEFINE_HAS_MEMBER(maybe_mask_indptr)
 DEFINE_HAS_MEMBER(num_kv_heads)
 
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi,
-          bool use_router = false>
+          bool use_router = false, bool use_aha_gate_router = false>
 struct DefaultAttention : AttentionVariantBase {
   static constexpr bool use_softmax = true;
+  static constexpr bool use_aha_router = use_aha_gate_router;
 
   uint8_t* custom_mask_ptr;
   uint32_t qo_len, kv_len;
@@ -73,7 +74,7 @@ struct DefaultAttention : AttentionVariantBase {
     router_sink_size = 0;
     if constexpr (use_router) {
       maybe_router = params.maybe_router;
-      router_is_aha_gate = false;
+      router_is_aha_gate = use_aha_gate_router;
       if constexpr (has_num_kv_heads_v<Params>) {
         num_kv_heads = params.num_kv_heads;
       } else {
@@ -82,7 +83,7 @@ struct DefaultAttention : AttentionVariantBase {
       if constexpr (has_router_sink_size_v<Params>) {
         router_sink_size = params.router_sink_size;
       }
-      if constexpr (has_router_is_aha_gate_v<Params>) {
+      if constexpr (!use_aha_gate_router && has_router_is_aha_gate_v<Params>) {
         router_is_aha_gate = params.router_is_aha_gate;
       }
       router_stride_n = num_kv_heads;
@@ -123,20 +124,27 @@ struct DefaultAttention : AttentionVariantBase {
     if constexpr (use_router) {
       bool route_value;
       if constexpr (has_q_indptr_v<Params>) {
-        if (router_is_aha_gate) {
+        if constexpr (use_aha_gate_router) {
           route_value =
               maybe_router[static_cast<uint64_t>(params.q_indptr[batch_idx] + qo_idx) *
                                router_stride_n +
                            static_cast<uint64_t>(kv_head_idx) * router_stride_h];
         } else {
-          route_value = maybe_router[static_cast<uint64_t>(batch_idx) * router_stride_n +
-                                     static_cast<uint64_t>(kv_head_idx) * router_stride_h];
+          if (router_is_aha_gate) {
+            route_value =
+                maybe_router[static_cast<uint64_t>(params.q_indptr[batch_idx] + qo_idx) *
+                                 router_stride_n +
+                             static_cast<uint64_t>(kv_head_idx) * router_stride_h];
+          } else {
+            route_value = maybe_router[static_cast<uint64_t>(batch_idx) * router_stride_n +
+                                       static_cast<uint64_t>(kv_head_idx) * router_stride_h];
+          }
         }
       } else {
         route_value = maybe_router[static_cast<uint64_t>(batch_idx) * router_stride_n +
                                    static_cast<uint64_t>(kv_head_idx) * router_stride_h];
       }
-      bool head_uses_local = router_is_aha_gate ? !route_value : route_value;
+      bool head_uses_local = use_aha_gate_router || router_is_aha_gate ? !route_value : route_value;
       if (head_uses_local) {
         bool in_sink = kv_idx < router_sink_size;
         bool in_recent = kv_idx + qo_len + window_left >= kv_len + qo_idx;

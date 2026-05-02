@@ -73,6 +73,7 @@ def get_batch_decode_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_router: bool = False,
+    use_aha_router: bool = False,
 ) -> str:
     return (
         f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -85,6 +86,7 @@ def get_batch_decode_uri(
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}"
         + (f"_use_router_{use_router}" if use_router else "")
+        + (f"_use_aha_router_{use_aha_router}" if use_aha_router else "")
     )
 
 
@@ -383,6 +385,7 @@ def get_batch_prefill_uri(
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
     use_router: bool = False,
+    use_aha_router: bool = False,
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -396,6 +399,7 @@ def get_batch_prefill_uri(
         f"use_logits_cap_{use_logits_soft_cap}_"
         f"f16qk_{use_fp16_qk_reduction}"
         + (f"_use_router_{use_router}" if use_router else "")
+        + (f"_use_aha_router_{use_aha_router}" if use_aha_router else "")
         + ("_sm90" if backend == "fa3" else "")
     )
 
@@ -921,6 +925,7 @@ def gen_batch_decode_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_router: bool = False,
+    use_aha_router: bool = False,
 ) -> JitSpec:
     uri = get_batch_decode_uri(
         dtype_q,
@@ -933,6 +938,7 @@ def gen_batch_decode_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_router=use_router,
+        use_aha_router=use_aha_router,
     )
     additional_tensor_names = ["maybe_alibi_slopes"]
     additional_tensor_dtypes = ["float"]
@@ -966,7 +972,7 @@ def gen_batch_decode_module(
         additional_tensor_dtypes,
         additional_scalar_names,
         additional_scalar_dtypes,
-        f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}, {str(use_router).lower()}>",  # variant_name
+        f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}, {str(use_router).lower()}, {str(use_aha_router).lower()}>",  # variant_name
         "#include<flashinfer/attention/variants.cuh>",  # variant_decl
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
@@ -987,6 +993,7 @@ def gen_batch_prefill_module(
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
     use_router: bool = False,
+    use_aha_router: bool = False,
 ) -> JitSpec:
     uri = get_batch_prefill_uri(
         backend,
@@ -1001,6 +1008,7 @@ def gen_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
         use_router=use_router,
+        use_aha_router=use_aha_router,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -1052,7 +1060,7 @@ def gen_batch_prefill_module(
             additional_scalar_dtypes.append("int64_t")
             additional_scalar_names.append("router_stride_h")
             additional_scalar_dtypes.append("int64_t")
-        variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}, {str(use_router).lower()}>"
+        variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}, {str(use_router).lower()}, {str(use_aha_router).lower()}>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
         if not fp8_enabled:

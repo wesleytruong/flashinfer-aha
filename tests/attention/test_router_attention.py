@@ -267,7 +267,7 @@ def test_batch_decode_router_sink_recent_matches_dense_reference():
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper_router = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, "NHD", use_router=True,
+        workspace_buffer, "NHD", use_router=True, use_aha_router=True,
     )
     wrapper_router.plan(
         kv_indptr, kv_indices, kv_last_page_len,
@@ -528,7 +528,7 @@ def test_batch_prefill_aha_token_router_sink_recent_matches_dense_reference(gate
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, "NHD", use_router=True, backend="fa2",
+        workspace_buffer, "NHD", use_router=True, use_aha_router=True, backend="fa2",
     )
     wrapper.plan(
         qo_indptr, kv_indptr, kv_indices, kv_last_page_len,

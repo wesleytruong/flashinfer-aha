@@ -22,6 +22,7 @@ from .version import __git_version__ as __git_version__
 
 AHA_BATCH_PREFILL_STRIDED_OUTPUT = True
 AHA_ROUTER_STRIDED = True
+AHA_ROUTER_SPECIALIZED = True
 
 
 from . import jit as jit

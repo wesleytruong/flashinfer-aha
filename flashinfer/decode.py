@@ -772,6 +772,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
         use_router: bool = False,
+        use_aha_router: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
@@ -838,7 +839,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._jit_module = None
 
         self._kv_layout = kv_layout
-        self._use_router = use_router
+        self._use_router = use_router or use_aha_router
+        self._use_aha_router = use_aha_router
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._int_workspace_buffer = torch.empty(
@@ -1172,6 +1174,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
                     self._use_router,
+                    self._use_aha_router,
                 )
 
             args = [
@@ -1214,6 +1217,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     self._use_router,
+                    self._use_aha_router,
                 )
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,

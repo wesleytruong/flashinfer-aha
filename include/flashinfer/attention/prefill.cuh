@@ -2161,8 +2161,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     // Per-head router: full-attention heads use window covering entire sequence
     if constexpr (has_maybe_router_v<Params>) {
       if (params.maybe_router != nullptr) {
-        bool is_aha_gate = false;
-        if constexpr (has_router_is_aha_gate_v<Params>) {
+        bool is_aha_gate = AttentionVariant::use_aha_router;
+        if constexpr (!AttentionVariant::use_aha_router && has_router_is_aha_gate_v<Params>) {
           is_aha_gate = params.router_is_aha_gate;
         }
         if (is_aha_gate ||
@@ -2183,7 +2183,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     uint32_t router_aha_recent_full_start = 0;
     if constexpr (has_maybe_router_v<Params>) {
       if constexpr (has_router_is_aha_gate_v<Params>) {
-        if (params.maybe_router != nullptr && params.router_is_aha_gate) {
+        if (params.maybe_router != nullptr &&
+            (AttentionVariant::use_aha_router || params.router_is_aha_gate)) {
           const uint32_t q_tile_start = (qo_tile_idx * CTA_TILE_Q) / group_size;
           bool lane_q_tile_all_local = q_tile_start < qo_upper_bound;
           bool lane_q_tile_all_full = q_tile_start < qo_upper_bound;
@@ -2221,7 +2222,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     if constexpr (has_maybe_router_v<Params>) {
       if constexpr (has_router_is_aha_gate_v<Params>) {
         force_logits_mask_every_iter =
-            params.maybe_router != nullptr && params.router_is_aha_gate &&
+            params.maybe_router != nullptr &&
+            (AttentionVariant::use_aha_router || params.router_is_aha_gate) &&
             !router_aha_q_tile_all_full &&
             !(router_aha_q_tile_all_local && router_aha_sink_size == 0);
       }

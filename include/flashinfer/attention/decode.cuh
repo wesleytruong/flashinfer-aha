@@ -66,7 +66,9 @@ __device__ __forceinline__ void compute_qk(
     const Params& params, AttentionVariant variant, const uint32_t batch_idx, const T* smem,
     const vec_t<float, vec_size>& q_vec, const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
     uint32_t iter_base, uint32_t iter_bound, uint32_t qo_head_idx, uint32_t kv_head_idx, float* s,
-    state_t<vec_size>& st, const uint32_t tx, const uint32_t ty, const uint32_t tz) {
+    state_t<vec_size>& st, const uint32_t tx, const uint32_t ty, const uint32_t tz,
+    bool use_aha_router_fast_mask = false, bool head_uses_router_swa = false,
+    uint32_t router_sink_size = 0, uint32_t router_swa_start = 0) {
   float m_prev = st.m;
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
@@ -95,8 +97,13 @@ __device__ __forceinline__ void compute_qk(
       s[j] *= variant.sm_scale_log2;
     }
 
-    bool mask = variant.LogitsMask(params, batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos, qo_head_idx,
-                                   kv_head_idx);
+    bool mask;
+    if (use_aha_router_fast_mask) {
+      mask = !head_uses_router_swa || pos < router_sink_size || pos + 1 > router_swa_start;
+    } else {
+      mask = variant.LogitsMask(params, batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos, qo_head_idx,
+                                kv_head_idx);
+    }
     s[j] = (iter_base + tz * tile_size + j < iter_bound && mask) ? s[j] : -math::inf;
     st.m = max(st.m, s[j]);
   }
@@ -447,19 +454,28 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     if constexpr (has_router_stride_h_v<Params>) {
       router_stride_h = static_cast<uint64_t>(params.router_stride_h);
     }
-    if (params.maybe_router != nullptr &&
-        params.maybe_router[static_cast<uint64_t>(batch_idx) * router_stride_n +
-                            static_cast<uint64_t>(kv_head_idx) * router_stride_h] !=
-            static_cast<uint8_t>(0)) {
-      head_uses_router_swa = true;
-      if constexpr (has_router_is_aha_gate_v<Params>) {
-        if (params.router_is_aha_gate) {
-          head_uses_router_swa = false;
-        }
-      }
-    } else if constexpr (has_router_is_aha_gate_v<Params>) {
-      if (params.maybe_router != nullptr && params.router_is_aha_gate) {
+    if constexpr (AttentionVariant::use_aha_router) {
+      if (params.maybe_router != nullptr &&
+          params.maybe_router[static_cast<uint64_t>(batch_idx) * router_stride_n +
+                              static_cast<uint64_t>(kv_head_idx) * router_stride_h] ==
+              static_cast<uint8_t>(0)) {
         head_uses_router_swa = true;
+      }
+    } else {
+      if (params.maybe_router != nullptr &&
+          params.maybe_router[static_cast<uint64_t>(batch_idx) * router_stride_n +
+                              static_cast<uint64_t>(kv_head_idx) * router_stride_h] !=
+              static_cast<uint8_t>(0)) {
+        head_uses_router_swa = true;
+        if constexpr (has_router_is_aha_gate_v<Params>) {
+          if (params.router_is_aha_gate) {
+            head_uses_router_swa = false;
+          }
+        }
+      } else if constexpr (has_router_is_aha_gate_v<Params>) {
+        if (params.maybe_router != nullptr && params.router_is_aha_gate) {
+          head_uses_router_swa = true;
+        }
       }
     }
     if (head_uses_router_swa) {
@@ -615,7 +631,8 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
           (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
               chunk_start + iter * tile_size_per_bdx * bdy * bdz,
           iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st, tx, ty,
-          tz);
+          tz, AttentionVariant::use_aha_router, head_uses_router_swa, router_sink_size,
+          router_swa_start);
     }
     block.sync();
 
