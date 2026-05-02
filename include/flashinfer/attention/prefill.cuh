@@ -2931,14 +2931,14 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
           const bool run_aha_router_merge =
               use_aha_router_merge && router_sink_size != 0 && decode_like;
           if (run_aha_router_merge) {
-            FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStridedAhaRouter(
+            FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStridedAhaDecodeRouter(
                 tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
                 params.total_num_rows, num_qo_heads, HEAD_DIM_VO, final_o_stride_n,
                 final_o_stride_h, aha_router_ptr, router_stride_n, router_stride_h,
-                params.q_indptr, params.paged_kv.indptr, params.paged_kv.last_page_len,
-                params.paged_kv.batch_size, static_cast<uint32_t>(params.paged_kv.page_size),
-                params.kv_chunk_size_ptr, num_qo_heads / num_kv_heads, params.window_left,
-                router_sink_size, enable_pdl, stream));
+                params.paged_kv.indptr, params.paged_kv.last_page_len,
+                static_cast<uint32_t>(params.paged_kv.page_size), params.kv_chunk_size_ptr,
+                num_qo_heads / num_kv_heads, params.window_left, router_sink_size, enable_pdl,
+                stream));
           } else {
             FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStrided(
                 tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,

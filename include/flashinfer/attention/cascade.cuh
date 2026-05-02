@@ -466,30 +466,15 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
 #endif
 }
 
-template <typename IdType>
-__device__ __forceinline__ uint32_t FindRequestFromQIndptr(const IdType* __restrict__ q_indptr,
-                                                           uint32_t batch_size, uint32_t pos) {
-  uint32_t lo = 0, hi = batch_size;
-  while (lo + 1 < hi) {
-    const uint32_t mid = (lo + hi) >> 1;
-    if (pos < static_cast<uint32_t>(q_indptr[mid])) {
-      hi = mid;
-    } else {
-      lo = mid;
-    }
-  }
-  return lo;
-}
-
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages,
           typename DTypeIn, typename DTypeO, typename IdType>
-__global__ void PersistentVariableLengthMergeStatesAhaRouterKernel(
+__global__ void PersistentVariableLengthMergeStatesAhaDecodeRouterKernel(
     DTypeIn* __restrict__ V, float* __restrict__ S, IdType* indptr, DTypeO* __restrict__ v_merged,
     float* __restrict__ s_merged, uint32_t max_seq_len, uint32_t* __restrict__ seq_len_ptr,
     uint32_t num_heads, uint32_t o_stride_n, uint32_t o_stride_h,
     const uint8_t* __restrict__ router, uint64_t router_stride_n, uint64_t router_stride_h,
-    const IdType* __restrict__ q_indptr, const IdType* __restrict__ kv_indptr,
-    const IdType* __restrict__ kv_last_page_len, uint32_t batch_size, uint32_t page_size,
+    const IdType* __restrict__ kv_indptr, const IdType* __restrict__ kv_last_page_len,
+    uint32_t page_size,
     const IdType* __restrict__ kv_chunk_size_ptr, uint32_t group_size, int32_t window_left,
     uint32_t router_sink_size) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -515,10 +500,7 @@ __global__ void PersistentVariableLengthMergeStatesAhaRouterKernel(
     const uint32_t indptr_begin = indptr[pos];
     const uint32_t full_num_index_sets = indptr[pos + 1] - indptr_begin;
 
-    const uint32_t request_idx = FindRequestFromQIndptr(q_indptr, batch_size, pos);
-    const uint32_t qo_start = q_indptr[request_idx];
-    const uint32_t qo_len = q_indptr[request_idx + 1] - qo_start;
-    const uint32_t q_idx = pos - qo_start;
+    const uint32_t request_idx = pos;
     const uint32_t kv_head_idx = head_idx / group_size;
     const bool head_uses_full =
         router == nullptr ||
@@ -533,10 +515,10 @@ __global__ void PersistentVariableLengthMergeStatesAhaRouterKernel(
       const uint32_t num_pages = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
       const uint32_t kv_len =
           num_pages == 0 ? 0 : (num_pages - 1) * page_size + kv_last_page_len[request_idx];
-      const uint32_t local_window = window_left < 0 ? kv_len : static_cast<uint32_t>(window_left);
+      const uint32_t local_window =
+          window_left < 0 ? kv_len : static_cast<uint32_t>(window_left) + 1;
       const uint32_t sink_size = min(router_sink_size, kv_len);
-      const uint32_t recent_start =
-          sub_if_greater_or_zero(kv_len + q_idx, qo_len + local_window);
+      const uint32_t recent_start = sub_if_greater_or_zero(kv_len, local_window);
       prefix_chunks = min(ceil_div(sink_size, kv_chunk_size), full_num_index_sets);
       recent_first_chunk = min(recent_start / kv_chunk_size, full_num_index_sets);
       recent_first_chunk = max(recent_first_chunk, prefix_chunks);
@@ -906,14 +888,14 @@ cudaError_t VariableLengthMergeStatesStrided(DTypeIn* v, float* s, IdType* indpt
 }
 
 template <typename DTypeIn, typename DTypeO, typename IdType>
-cudaError_t VariableLengthMergeStatesStridedAhaRouter(
+cudaError_t VariableLengthMergeStatesStridedAhaDecodeRouter(
     DTypeIn* v, float* s, IdType* indptr, DTypeO* v_merged, float* s_merged,
     uint32_t max_seq_len, uint32_t* seq_len, uint32_t num_heads, uint32_t head_dim,
     uint32_t o_stride_n, uint32_t o_stride_h, const uint8_t* router, uint64_t router_stride_n,
-    uint64_t router_stride_h, const IdType* q_indptr, const IdType* kv_indptr,
-    const IdType* kv_last_page_len, uint32_t batch_size, uint32_t page_size,
-    const IdType* kv_chunk_size_ptr, uint32_t group_size, int32_t window_left,
-    uint32_t router_sink_size, bool enable_pdl, cudaStream_t stream = nullptr) {
+    uint64_t router_stride_h, const IdType* kv_indptr, const IdType* kv_last_page_len,
+    uint32_t page_size, const IdType* kv_chunk_size_ptr, uint32_t group_size,
+    int32_t window_left, uint32_t router_sink_size, bool enable_pdl,
+    cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
   int num_blocks_per_sm = 0;
@@ -928,7 +910,7 @@ cudaError_t VariableLengthMergeStatesStridedAhaRouter(
     constexpr uint32_t num_smem_stages = 4;
     uint32_t smem_size =
         num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
-    auto kernel = PersistentVariableLengthMergeStatesAhaRouterKernel<
+    auto kernel = PersistentVariableLengthMergeStatesAhaDecodeRouterKernel<
         vec_size, bdx, bdy, num_smem_stages, DTypeIn, DTypeO, IdType>;
     FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
                                                                        num_threads, smem_size));
@@ -949,10 +931,8 @@ cudaError_t VariableLengthMergeStatesStridedAhaRouter(
                     &router,
                     &router_stride_n,
                     &router_stride_h,
-                    &q_indptr,
                     &kv_indptr,
                     &kv_last_page_len,
-                    &batch_size,
                     &page_size,
                     &kv_chunk_size_ptr,
                     &group_size,
@@ -974,9 +954,8 @@ cudaError_t VariableLengthMergeStatesStridedAhaRouter(
       config.stream = stream;
       FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
           &config, kernel, v, s, indptr, v_merged, s_merged, max_seq_len, seq_len, num_heads,
-          o_stride_n, o_stride_h, router, router_stride_n, router_stride_h, q_indptr, kv_indptr,
-          kv_last_page_len, batch_size, page_size, kv_chunk_size_ptr, group_size, window_left,
-          router_sink_size));
+          o_stride_n, o_stride_h, router, router_stride_n, router_stride_h, kv_indptr,
+          kv_last_page_len, page_size, kv_chunk_size_ptr, group_size, window_left, router_sink_size));
     } else {
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
     }
