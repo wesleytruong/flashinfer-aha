@@ -2903,10 +2903,48 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         }
         if constexpr (AttentionVariant::use_softmax) {
-          FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStrided(
-              tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, final_o_stride_n,
-              final_o_stride_h, enable_pdl, stream));
+          bool use_aha_router_merge = false;
+          uint8_t* aha_router_ptr = nullptr;
+          uint64_t router_stride_n = num_kv_heads;
+          uint64_t router_stride_h = 1;
+          uint32_t router_sink_size = 0;
+          if constexpr (has_maybe_router_v<Params>) {
+            if (params.maybe_router != nullptr) {
+              aha_router_ptr = params.maybe_router;
+              if constexpr (AttentionVariant::use_aha_router) {
+                use_aha_router_merge = true;
+              } else if constexpr (has_router_is_aha_gate_v<Params>) {
+                use_aha_router_merge = params.router_is_aha_gate;
+              }
+            }
+          }
+          if constexpr (has_router_stride_n_v<Params>) {
+            router_stride_n = static_cast<uint64_t>(params.router_stride_n);
+          }
+          if constexpr (has_router_stride_h_v<Params>) {
+            router_stride_h = static_cast<uint64_t>(params.router_stride_h);
+          }
+          if constexpr (has_router_sink_size_v<Params>) {
+            router_sink_size = static_cast<uint32_t>(params.router_sink_size);
+          }
+          const bool decode_like = params.max_total_num_rows == params.paged_kv.batch_size;
+          const bool run_aha_router_merge =
+              use_aha_router_merge && router_sink_size != 0 && decode_like;
+          if (run_aha_router_merge) {
+            FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStridedAhaRouter(
+                tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
+                params.total_num_rows, num_qo_heads, HEAD_DIM_VO, final_o_stride_n,
+                final_o_stride_h, aha_router_ptr, router_stride_n, router_stride_h,
+                params.q_indptr, params.paged_kv.indptr, params.paged_kv.last_page_len,
+                params.paged_kv.batch_size, static_cast<uint32_t>(params.paged_kv.page_size),
+                params.kv_chunk_size_ptr, num_qo_heads / num_kv_heads, params.window_left,
+                router_sink_size, enable_pdl, stream));
+          } else {
+            FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStrided(
+                tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
+                params.total_num_rows, num_qo_heads, HEAD_DIM_VO, final_o_stride_n,
+                final_o_stride_h, enable_pdl, stream));
+          }
         } else {
           FLASHINFER_CUDA_CALL(VariableLengthAttentionSumStrided(
               tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
