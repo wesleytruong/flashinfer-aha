@@ -2284,6 +2284,39 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     asm volatile("griddepcontrol.wait;");
 #endif
 
+    const bool router_aha_chunk_empty =
+        partition_kv && router_aha_q_tile_all_local && chunk_size > 0 &&
+        chunk_start >= router_aha_sink_size && chunk_end <= router_aha_recent_start;
+    if (router_aha_chunk_empty) {
+      const uint32_t num_kv_chunks = ceil_div(kv_len_safe, kv_chunk_size);
+      write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
+                                /*o_stride_n=*/num_kv_chunks * o_stride_n,
+                                /*o_stride_h=*/o_stride_h, group_size, tid);
+      if constexpr (variant.use_softmax) {
+        if (lse != nullptr && get_warp_idx_kv<KTraits>(tid.z) == 0) {
+#pragma unroll
+          for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+            for (uint32_t j = 0; j < 2; ++j) {
+              uint32_t q, r;
+              group_size.divmod(qo_packed_idx_base + lane_idx / 4 + j * 8 + mma_q * 16, q, r);
+              const uint32_t qo_head_idx = kv_head_idx * group_size + r;
+              const uint32_t qo_idx = q;
+              if (qo_idx < qo_upper_bound) {
+                lse[(o_indptr[request_idx] + qo_idx * num_kv_chunks + kv_tile_idx) *
+                        num_qo_heads +
+                    qo_head_idx] = -math::inf;
+              }
+            }
+          }
+        }
+      }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+      asm volatile("griddepcontrol.launch_dependents;");
+#endif
+      return;
+    }
+
     load_q_global_smem<KTraits>(qo_packed_idx_base, qo_upper_bound, q_ptr_base, q_stride_n,
                                 q_stride_h, group_size, &qo_smem, tid);
 
