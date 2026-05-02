@@ -2172,14 +2172,19 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         const uint8_t route_value =
             params.maybe_router[static_cast<uint64_t>(request_idx) * router_stride_n +
                                 static_cast<uint64_t>(kv_head_idx) * router_stride_h];
-        if (is_aha_gate && route_sink_size == 0 && route_value == static_cast<uint8_t>(0)) {
+        if (is_aha_gate && route_value == static_cast<uint8_t>(0)) {
           const uint32_t local_window_left =
               params.window_left >= 0 ? static_cast<uint32_t>(params.window_left) : kv_len;
-          const uint32_t kv_start_idx =
-              sub_if_greater_or_zero(kv_len + (qo_tile_idx * CTA_TILE_Q) / group_size,
-                                     qo_len + local_window_left);
+          const uint32_t q_tile_start = (qo_tile_idx * CTA_TILE_Q) / group_size;
+          const uint32_t recent_start =
+              sub_if_greater_or_zero(kv_len + q_tile_start, qo_len + local_window_left);
+          const uint32_t kv_start_idx = route_sink_size == 0 ? recent_start : 0;
           const uint32_t chunk_start = min(kv_tile_idx * kv_chunk_size + kv_start_idx, kv_len);
-          if (chunk_start >= kv_len) {
+          const uint32_t chunk_end =
+              min((kv_tile_idx + 1) * kv_chunk_size + kv_start_idx, kv_len);
+          const uint32_t sink_size = min(route_sink_size, kv_len);
+          if (chunk_start >= kv_len ||
+              (sink_size != 0 && chunk_start >= sink_size && chunk_end <= recent_start)) {
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
             asm volatile("griddepcontrol.launch_dependents;");
 #endif
