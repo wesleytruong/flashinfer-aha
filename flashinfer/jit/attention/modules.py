@@ -950,6 +950,10 @@ def gen_batch_decode_module(
         additional_scalar_dtypes.append("uint32_t")
         additional_scalar_names.append("router_is_aha_gate")
         additional_scalar_dtypes.append("bool")
+        additional_scalar_names.append("router_stride_n")
+        additional_scalar_dtypes.append("int64_t")
+        additional_scalar_names.append("router_stride_h")
+        additional_scalar_dtypes.append("int64_t")
     return gen_customize_batch_decode_module(
         uri,
         dtype_q,
@@ -1044,6 +1048,10 @@ def gen_batch_prefill_module(
             additional_scalar_dtypes.append("uint32_t")
             additional_scalar_names.append("router_is_aha_gate")
             additional_scalar_dtypes.append("bool")
+            additional_scalar_names.append("router_stride_n")
+            additional_scalar_dtypes.append("int64_t")
+            additional_scalar_names.append("router_stride_h")
+            additional_scalar_dtypes.append("int64_t")
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}, {str(use_router).lower()}>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:

@@ -76,6 +76,12 @@ from .utils import (
 )
 
 
+def _router_strides(maybe_router: Optional[torch.Tensor]) -> Tuple[int, int]:
+    if maybe_router is None:
+        return 0, 1
+    return int(maybe_router.stride(0)), int(maybe_router.stride(1))
+
+
 @functools.cache
 def get_single_decode_module(*args):
     uri = get_single_decode_uri(*args)
@@ -264,6 +270,7 @@ def get_batch_decode_module(*args):
             router_sink_size: int,
             router_is_aha_gate: bool,
         ) -> None:
+            router_stride_n, router_stride_h = _router_strides(maybe_router)
             run_func(
                 float_workspace_buffer,
                 int_workspace_buffer,
@@ -287,6 +294,8 @@ def get_batch_decode_module(*args):
                 1.0 / rope_theta,  # rope_rcp_theta
                 router_sink_size,
                 router_is_aha_gate,
+                router_stride_n,
+                router_stride_h,
             )
 
         @register_fake_op(f"flashinfer::{uri}_run")

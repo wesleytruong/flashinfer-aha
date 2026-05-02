@@ -66,6 +66,12 @@ from .utils import (
 )
 
 
+def _router_strides(maybe_router: Optional[torch.Tensor]) -> Tuple[int, int]:
+    if maybe_router is None:
+        return 0, 1
+    return int(maybe_router.stride(0)), int(maybe_router.stride(1))
+
+
 def _split_scale_param(scale):
     """Split scale parameter into tensor and scalar components.
 
@@ -467,6 +473,7 @@ def get_batch_prefill_module(backend, *args):
         is_fp8 = scale_q is not None
 
         if backend == "fa2":
+            router_stride_n, router_stride_h = _router_strides(maybe_router)
             fa2_args = [
                 float_workspace_buffer,
                 int_workspace_buffer,
@@ -501,6 +508,8 @@ def get_batch_prefill_module(backend, *args):
             if _use_router:
                 fa2_args.append(router_sink_size)
                 fa2_args.append(router_is_aha_gate)
+                fa2_args.append(router_stride_n)
+                fa2_args.append(router_stride_h)
             ragged_run_func(*fa2_args)
         elif is_fp8:
             # FA3 FP8: scale_q, scale_k, scale_v, sm_scale, scale_q_scalar, scale_k_scalar, scale_v_scalar
@@ -694,6 +703,7 @@ def get_batch_prefill_module(backend, *args):
             )
         elif backend == "fa2":
             assert not is_float8(q)
+            router_stride_n, router_stride_h = _router_strides(maybe_router)
             fa2_args = [
                 float_workspace_buffer,
                 int_workspace_buffer,
@@ -730,6 +740,8 @@ def get_batch_prefill_module(backend, *args):
             if _use_router:
                 fa2_args.append(router_sink_size)
                 fa2_args.append(router_is_aha_gate)
+                fa2_args.append(router_stride_n)
+                fa2_args.append(router_stride_h)
             paged_run_func(*fa2_args)
         else:
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)

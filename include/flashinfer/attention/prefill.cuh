@@ -2142,6 +2142,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       return;
     }
     const uint32_t num_qo_heads = num_kv_heads * group_size;
+    uint64_t router_stride_n = num_kv_heads;
+    uint64_t router_stride_h = 1;
+    if constexpr (has_router_stride_n_v<Params>) {
+      router_stride_n = static_cast<uint64_t>(params.router_stride_n);
+    }
+    if constexpr (has_router_stride_h_v<Params>) {
+      router_stride_h = static_cast<uint64_t>(params.router_stride_h);
+    }
 
     const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
@@ -2158,7 +2166,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           is_aha_gate = params.router_is_aha_gate;
         }
         if (is_aha_gate ||
-            !params.maybe_router[request_idx * num_kv_heads + kv_head_idx]) {
+            !params.maybe_router[static_cast<uint64_t>(request_idx) * router_stride_n +
+                                 static_cast<uint64_t>(kv_head_idx) * router_stride_h]) {
           window_left = kv_len;
         }
       }
@@ -2181,8 +2190,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           for (uint32_t q_idx = q_tile_start + lane_idx; q_idx < qo_upper_bound;
                q_idx += WARP_SIZE) {
             const uint8_t route_value =
-                params.maybe_router[(q_indptr[request_idx] + q_idx) * num_kv_heads +
-                                    kv_head_idx];
+                params.maybe_router[static_cast<uint64_t>(q_indptr[request_idx] + q_idx) *
+                                        router_stride_n +
+                                    static_cast<uint64_t>(kv_head_idx) * router_stride_h];
             if (route_value != static_cast<uint8_t>(0)) {
               lane_q_tile_all_local = false;
             } else {

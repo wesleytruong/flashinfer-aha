@@ -42,6 +42,8 @@ struct DefaultAttention : AttentionVariantBase {
   float soft_cap_pre_tanh_scale;
   uint8_t* maybe_router;
   uint32_t num_kv_heads;
+  uint64_t router_stride_n;
+  uint64_t router_stride_h;
   bool router_is_aha_gate;
 
   // Create closure
@@ -83,6 +85,14 @@ struct DefaultAttention : AttentionVariantBase {
       if constexpr (has_router_is_aha_gate_v<Params>) {
         router_is_aha_gate = params.router_is_aha_gate;
       }
+      router_stride_n = num_kv_heads;
+      router_stride_h = 1;
+      if constexpr (has_router_stride_n_v<Params>) {
+        router_stride_n = static_cast<uint64_t>(params.router_stride_n);
+      }
+      if constexpr (has_router_stride_h_v<Params>) {
+        router_stride_h = static_cast<uint64_t>(params.router_stride_h);
+      }
     }
   }
 
@@ -114,13 +124,17 @@ struct DefaultAttention : AttentionVariantBase {
       bool route_value;
       if constexpr (has_q_indptr_v<Params>) {
         if (router_is_aha_gate) {
-          route_value = maybe_router[(params.q_indptr[batch_idx] + qo_idx) * num_kv_heads +
-                                     kv_head_idx];
+          route_value =
+              maybe_router[static_cast<uint64_t>(params.q_indptr[batch_idx] + qo_idx) *
+                               router_stride_n +
+                           static_cast<uint64_t>(kv_head_idx) * router_stride_h];
         } else {
-          route_value = maybe_router[batch_idx * num_kv_heads + kv_head_idx];
+          route_value = maybe_router[static_cast<uint64_t>(batch_idx) * router_stride_n +
+                                     static_cast<uint64_t>(kv_head_idx) * router_stride_h];
         }
       } else {
-        route_value = maybe_router[batch_idx * num_kv_heads + kv_head_idx];
+        route_value = maybe_router[static_cast<uint64_t>(batch_idx) * router_stride_n +
+                                   static_cast<uint64_t>(kv_head_idx) * router_stride_h];
       }
       bool head_uses_local = router_is_aha_gate ? !route_value : route_value;
       if (head_uses_local) {

@@ -439,8 +439,17 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   uint32_t router_sink_size = 0;
   uint32_t router_swa_start = 0;
   if constexpr (has_maybe_router_v<Params>) {
+    uint64_t router_stride_n = params.paged_kv.num_heads;
+    uint64_t router_stride_h = 1;
+    if constexpr (has_router_stride_n_v<Params>) {
+      router_stride_n = static_cast<uint64_t>(params.router_stride_n);
+    }
+    if constexpr (has_router_stride_h_v<Params>) {
+      router_stride_h = static_cast<uint64_t>(params.router_stride_h);
+    }
     if (params.maybe_router != nullptr &&
-        params.maybe_router[batch_idx * params.paged_kv.num_heads + kv_head_idx] !=
+        params.maybe_router[static_cast<uint64_t>(batch_idx) * router_stride_n +
+                            static_cast<uint64_t>(kv_head_idx) * router_stride_h] !=
             static_cast<uint8_t>(0)) {
       head_uses_router_swa = true;
       if constexpr (has_router_is_aha_gate_v<Params>) {
