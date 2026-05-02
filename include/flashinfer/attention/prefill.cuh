@@ -2161,6 +2161,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len;
     uint32_t window_left = variant.window_left;
     const uint32_t router_window_left = window_left;
+    const bool decode_like = params.max_total_num_rows == params.paged_kv.batch_size;
+    bool decode_like_aha_tile_state_valid = false;
+    bool decode_like_aha_q_tile_all_local = false;
+    bool decode_like_aha_q_tile_all_full = false;
     // Per-head router: full-attention heads use window covering entire sequence
     if constexpr (has_maybe_router_v<Params>) {
       if (params.maybe_router != nullptr) {
@@ -2175,6 +2179,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         uint32_t route_sink_size = 0;
         if constexpr (has_router_sink_size_v<Params>) {
           route_sink_size = static_cast<uint32_t>(params.router_sink_size);
+        }
+        if (is_aha_gate && decode_like) {
+          decode_like_aha_tile_state_valid = true;
+          decode_like_aha_q_tile_all_local = route_value == static_cast<uint8_t>(0);
+          decode_like_aha_q_tile_all_full = route_value != static_cast<uint8_t>(0);
         }
         const bool head_uses_full =
             is_aha_gate ? (!decode_like || route_sink_size != 0 ||
@@ -2195,7 +2204,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     uint32_t router_aha_recent_start = 0;
     uint32_t router_aha_recent_full_start = 0;
     bool router_aha_tile_state_loaded = false;
-    if constexpr (has_maybe_router_tile_state_v<Params>) {
+    if (decode_like_aha_tile_state_valid) {
+      router_aha_q_tile_all_local = decode_like_aha_q_tile_all_local;
+      router_aha_q_tile_all_full = decode_like_aha_q_tile_all_full;
+      router_aha_tile_state_loaded = true;
+    } else if constexpr (has_maybe_router_tile_state_v<Params>) {
       if (partition_kv && params.maybe_router_tile_state != nullptr) {
         const uint32_t router_tile_bx = bx - kv_tile_idx;
         const uint8_t router_tile_state =
@@ -2282,7 +2295,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                     ceil_div(chunk_size, CTA_TILE_KV));
       router_aha_recent_iteration = max(router_aha_recent_iteration, router_aha_prefix_iterations);
     }
-    const bool decode_like = params.max_total_num_rows == params.paged_kv.batch_size;
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
     DTypeQKAccum m[NUM_MMA_Q][2];
@@ -3008,6 +3020,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
           if constexpr (!AttentionVariant::use_aha_router && has_router_is_aha_gate_v<Params>) {
             build_router_tile_state = build_router_tile_state && params.router_is_aha_gate;
           }
+          build_router_tile_state = build_router_tile_state && !decode_like;
           if (build_router_tile_state) {
             dim3 router_nblks(padded_batch_size, num_kv_heads);
             BuildAhaPrefillRouterTileStateKernel<CTA_TILE_Q, AttentionVariant, Params>
