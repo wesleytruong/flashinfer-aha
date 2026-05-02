@@ -492,11 +492,13 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   }
 
   if (head_uses_router_swa && chunk_start >= router_sink_size && chunk_end <= router_swa_start) {
-    state_t<vec_size> st;
-    if (tz == 0) {
-      st.o.cast_store(o + (bx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
-      if (lse != nullptr) {
-        lse[bx * num_qo_heads + qo_head_idx] = st.get_lse();
+    if constexpr (!AttentionVariant::use_aha_router) {
+      state_t<vec_size> st;
+      if (tz == 0) {
+        st.o.cast_store(o + (bx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+        if (lse != nullptr) {
+          lse[bx * num_qo_heads + qo_head_idx] = st.get_lse();
+        }
       }
     }
     return;
@@ -916,9 +918,27 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         }
         if constexpr (AttentionVariant::use_softmax) {
-          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
-              tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr,
-              num_qo_heads, HEAD_DIM, enable_pdl, stream));
+          if constexpr (AttentionVariant::use_aha_router && has_maybe_router_v<Params> &&
+                        has_router_stride_n_v<Params> && has_router_stride_h_v<Params> &&
+                        has_router_sink_size_v<Params>) {
+            if (params.maybe_router != nullptr) {
+              FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStridedAhaDecodeRouter(
+                  tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr,
+                  num_qo_heads, HEAD_DIM, num_qo_heads * HEAD_DIM, HEAD_DIM, params.maybe_router,
+                  params.router_stride_n, params.router_stride_h, params.paged_kv.indptr,
+                  params.paged_kv.last_page_len, params.paged_kv.page_size,
+                  params.kv_chunk_size_ptr, num_qo_heads / num_kv_heads, params.window_left,
+                  params.router_sink_size, enable_pdl, stream));
+            } else {
+              FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+                  tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr,
+                  num_qo_heads, HEAD_DIM, enable_pdl, stream));
+            }
+          } else {
+            FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+                tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr,
+                num_qo_heads, HEAD_DIM, enable_pdl, stream));
+          }
         } else {
           FLASHINFER_CUDA_CALL(
               VariableLengthAttentionSum(tmp_v, params.o_indptr, o, params.paged_kv.batch_size,
