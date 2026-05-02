@@ -466,6 +466,17 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     }
   }
 
+  if (head_uses_router_swa && chunk_start >= router_sink_size && chunk_end <= router_swa_start) {
+    state_t<vec_size> st;
+    if (tz == 0) {
+      st.o.cast_store(o + (bx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+      if (lse != nullptr) {
+        lse[bx * num_qo_heads + qo_head_idx] = st.get_lse();
+      }
+    }
+    return;
+  }
+
   AttentionVariant variant(params, batch_idx, smem);
   DTypeKV* k_smem = (DTypeKV*)smem;
   DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
