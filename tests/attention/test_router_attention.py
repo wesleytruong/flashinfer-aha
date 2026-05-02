@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -282,6 +283,87 @@ def test_batch_decode_router_sink_recent_matches_dense_reference():
     )
 
     torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=2e-3, atol=2e-3)
+
+
+def test_tensor_core_fast_decode_aha_all_full_uses_full_plan():
+    """AHA fast_decode_plan must not shrink full heads to window_left."""
+    torch.manual_seed(17)
+    batch_size = 2
+    kv_len = 4096
+    window_left = 255
+    num_kv_heads = 4
+    num_qo_heads = 8
+    head_dim = 128
+    page_size = 16
+
+    q = torch.randn(
+        batch_size,
+        num_qo_heads,
+        head_dim,
+        dtype=torch.float16,
+        device="cuda:0",
+    )
+    k_data, v_data, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+        batch_size, kv_len, num_kv_heads, head_dim, page_size,
+    )
+    workspace_buffer = torch.empty(
+        128 * 1024 * 1024, dtype=torch.int8, device="cuda:0"
+    )
+
+    wrapper_ref = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", use_tensor_cores=True,
+    )
+    wrapper_ref.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        data_type=torch.float16,
+        q_data_type=torch.float16,
+    )
+    expected = wrapper_ref.run(q, (k_data, v_data))
+
+    wrapper_router = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", use_tensor_cores=True,
+        use_router=True, use_aha_router=True,
+    )
+    wrapper_router.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        window_left=window_left,
+        data_type=torch.float16,
+        q_data_type=torch.float16,
+    )
+    wrapper_router.plan = partial(flashinfer.fast_decode_plan, wrapper_router)
+    wrapper_router.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        window_left=window_left,
+        data_type=torch.float16,
+        q_data_type=torch.float16,
+    )
+
+    aha_gate = torch.ones(
+        batch_size, num_kv_heads, dtype=torch.uint8, device="cuda:0"
+    )
+    actual = wrapper_router.run(
+        q, (k_data, v_data), aha_gate=aha_gate, router_sink_size=0,
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
