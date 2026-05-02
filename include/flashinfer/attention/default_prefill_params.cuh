@@ -184,6 +184,7 @@ struct BatchPrefillRaggedParams {
   uint16_t* maybe_token_pos_in_items_ptr;
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
+  uint8_t* maybe_router_tile_state;
 
   __host__ BatchPrefillRaggedParams()
       : q(nullptr),
@@ -228,7 +229,8 @@ struct BatchPrefillRaggedParams {
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
         token_pos_in_items_len(0),
-        maybe_max_item_len_ptr(nullptr) {}
+        maybe_max_item_len_ptr(nullptr),
+        maybe_router_tile_state(nullptr) {}
 
   __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* maybe_custom_mask,
                                     IdType* q_indptr, IdType* kv_indptr, IdType* maybe_mask_indptr,
@@ -281,7 +283,8 @@ struct BatchPrefillRaggedParams {
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
         token_pos_in_items_len(0),
-        maybe_max_item_len_ptr(nullptr) {}
+        maybe_max_item_len_ptr(nullptr),
+        maybe_router_tile_state(nullptr) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
@@ -335,6 +338,7 @@ struct BatchPrefillPagedParams {
   uint16_t* maybe_token_pos_in_items_ptr;
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
+  uint8_t* maybe_router_tile_state;
 
   __host__ BatchPrefillPagedParams()
       : q(nullptr),
@@ -371,7 +375,8 @@ struct BatchPrefillPagedParams {
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
         token_pos_in_items_len(0),
-        maybe_max_item_len_ptr(nullptr) {}
+        maybe_max_item_len_ptr(nullptr),
+        maybe_router_tile_state(nullptr) {}
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
                                    uint8_t* maybe_custom_mask, IdType* q_indptr,
@@ -414,7 +419,8 @@ struct BatchPrefillPagedParams {
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
         token_pos_in_items_len(0),
-        maybe_max_item_len_ptr(nullptr) {}
+        maybe_max_item_len_ptr(nullptr),
+        maybe_router_tile_state(nullptr) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];

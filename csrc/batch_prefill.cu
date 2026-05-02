@@ -156,6 +156,7 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
         params.max_total_num_rows = 0;
         params.padded_batch_size = 0;
         params.partition_kv = false;
+        params.maybe_router_tile_state = nullptr;
 
         ADDITIONAL_PARAMS_SETTER
 
@@ -176,6 +177,10 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
           tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
           tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
+          if (plan_info.router_tile_state_offset != 0) {
+            params.maybe_router_tile_state =
+                GetPtrFromBaseOffset<uint8_t>(int_buffer_ptr, plan_info.router_tile_state_offset);
+          }
           if (plan_info.enable_cuda_graph) {
             params.block_valid_mask =
                 GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
@@ -293,6 +298,7 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         params.max_total_num_rows = 0;
         params.padded_batch_size = 0;
         params.partition_kv = false;
+        params.maybe_router_tile_state = nullptr;
 
         ADDITIONAL_PARAMS_SETTER
 
@@ -313,6 +319,10 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
           tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
           tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
+          if (plan_info.router_tile_state_offset != 0) {
+            params.maybe_router_tile_state =
+                GetPtrFromBaseOffset<uint8_t>(int_buffer_ptr, plan_info.router_tile_state_offset);
+          }
           if (plan_info.enable_cuda_graph) {
             params.block_valid_mask =
                 GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);

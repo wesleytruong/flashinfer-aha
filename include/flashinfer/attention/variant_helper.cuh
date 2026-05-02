@@ -30,6 +30,7 @@ DEFINE_HAS_MEMBER(router_sink_size)
 DEFINE_HAS_MEMBER(router_is_aha_gate)
 DEFINE_HAS_MEMBER(router_stride_n)
 DEFINE_HAS_MEMBER(router_stride_h)
+DEFINE_HAS_MEMBER(maybe_router_tile_state)
 DEFINE_HAS_MEMBER(q_indptr)
 
 #define REGISTER_QUERY_TRANSFORM(params, q, ...)                                    \

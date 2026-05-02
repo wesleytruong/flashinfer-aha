@@ -623,6 +623,7 @@ struct PrefillPlanInfo {
   int64_t merge_indptr_offset;
   int64_t o_indptr_offset;
   int64_t kv_chunk_size_ptr_offset;
+  int64_t router_tile_state_offset;
   int64_t v_offset;
   int64_t s_offset;
   int64_t block_valid_mask_offset;
@@ -640,6 +641,7 @@ struct PrefillPlanInfo {
         merge_indptr_offset(0),
         o_indptr_offset(0),
         kv_chunk_size_ptr_offset(0),
+        router_tile_state_offset(0),
         v_offset(0),
         s_offset(0),
         block_valid_mask_offset(0),
@@ -658,6 +660,7 @@ struct PrefillPlanInfo {
             merge_indptr_offset,
             o_indptr_offset,
             kv_chunk_size_ptr_offset,
+            router_tile_state_offset,
             v_offset,
             s_offset,
             block_valid_mask_offset,
@@ -667,9 +670,10 @@ struct PrefillPlanInfo {
 
   // From std::vector<int64_t> to PrefillPlanInfo
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 15) {
+    if (vec.size() != 15 && vec.size() != 16) {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanInfo::FromVector: vec.size() should be 15, but got " << vec.size();
+      err_msg << "PrefillPlanInfo::FromVector: vec.size() should be 15 or 16, but got "
+              << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     padded_batch_size = vec[0];
@@ -682,11 +686,21 @@ struct PrefillPlanInfo {
     merge_indptr_offset = vec[7];
     o_indptr_offset = vec[8];
     kv_chunk_size_ptr_offset = vec[9];
-    v_offset = vec[10];
-    s_offset = vec[11];
-    block_valid_mask_offset = vec[12];
-    enable_cuda_graph = vec[13];
-    split_kv = vec[14];
+    if (vec.size() == 16) {
+      router_tile_state_offset = vec[10];
+      v_offset = vec[11];
+      s_offset = vec[12];
+      block_valid_mask_offset = vec[13];
+      enable_cuda_graph = vec[14];
+      split_kv = vec[15];
+    } else {
+      router_tile_state_offset = 0;
+      v_offset = vec[10];
+      s_offset = vec[11];
+      block_valid_mask_offset = vec[12];
+      enable_cuda_graph = vec[13];
+      split_kv = vec[14];
+    }
   }
 };
 
@@ -776,6 +790,9 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
         num_qo_heads * padded_batch_size * cta_tile_q * sizeof(float), 16, "batch_prefill_tmp_s");
     plan_info.merge_indptr_offset = int_allocator.aligned_alloc_offset(
         sizeof(IdType) * (plan_info.total_num_rows + 1), 16, "batch_prefill_merge_indptr");
+    plan_info.router_tile_state_offset = int_allocator.aligned_alloc_offset(
+        sizeof(uint8_t) * padded_batch_size * num_kv_heads, 16,
+        "batch_prefill_router_tile_state");
     plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(
         sizeof(bool) * padded_batch_size, 16, "batch_prefill_block_valid_mask");
 

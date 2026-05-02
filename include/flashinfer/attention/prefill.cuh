@@ -51,6 +51,9 @@ using cp_async::SharedMemFillMode;
 using mma::MMAMode;
 
 constexpr uint32_t WARP_SIZE = 32;
+constexpr uint8_t kAhaRouterTileMixed = 0;
+constexpr uint8_t kAhaRouterTileAllLocal = 1;
+constexpr uint8_t kAhaRouterTileAllFull = 2;
 
 constexpr uint32_t get_num_warps_q(const uint32_t cta_tile_q) {
   if (cta_tile_q > 16) {
@@ -2181,10 +2184,23 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     uint32_t router_aha_sink_size = 0;
     uint32_t router_aha_recent_start = 0;
     uint32_t router_aha_recent_full_start = 0;
+    bool router_aha_tile_state_loaded = false;
+    if constexpr (has_maybe_router_tile_state_v<Params>) {
+      if (partition_kv && params.maybe_router_tile_state != nullptr) {
+        const uint32_t router_tile_bx = bx - kv_tile_idx;
+        const uint8_t router_tile_state =
+            params.maybe_router_tile_state[static_cast<uint64_t>(router_tile_bx) * num_kv_heads +
+                                           kv_head_idx];
+        router_aha_q_tile_all_local = router_tile_state == kAhaRouterTileAllLocal;
+        router_aha_q_tile_all_full = router_tile_state == kAhaRouterTileAllFull;
+        router_aha_tile_state_loaded = true;
+      }
+    }
     if constexpr (has_maybe_router_v<Params>) {
       if constexpr (has_router_is_aha_gate_v<Params>) {
         if (params.maybe_router != nullptr &&
-            (AttentionVariant::use_aha_router || params.router_is_aha_gate)) {
+            (AttentionVariant::use_aha_router || params.router_is_aha_gate) &&
+            !router_aha_tile_state_loaded) {
           const uint32_t q_tile_start = (qo_tile_idx * CTA_TILE_Q) / group_size;
           bool lane_q_tile_all_local = q_tile_start < qo_upper_bound;
           bool lane_q_tile_all_full = q_tile_start < qo_upper_bound;
@@ -2202,20 +2218,21 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           }
           router_aha_q_tile_all_local = __all_sync(0xffffffff, lane_q_tile_all_local);
           router_aha_q_tile_all_full = __all_sync(0xffffffff, lane_q_tile_all_full);
-          if (router_aha_q_tile_all_local) {
-            if constexpr (has_router_sink_size_v<Params>) {
-              router_aha_sink_size = min((uint32_t)params.router_sink_size, kv_len);
-            }
-            router_aha_recent_start = sub_if_greater_or_zero(
-                kv_len + q_tile_start, qo_len + router_window_left);
-            const uint32_t q_tile_last = qo_upper_bound > 0 ? qo_upper_bound - 1 : q_tile_start;
-            router_aha_recent_full_start = sub_if_greater_or_zero(
-                kv_len + q_tile_last, qo_len + router_window_left);
-            if (router_aha_sink_size == 0) {
-              window_left = router_window_left;
-            }
-          }
         }
+      }
+    }
+    if (router_aha_q_tile_all_local) {
+      if constexpr (has_router_sink_size_v<Params>) {
+        router_aha_sink_size = min((uint32_t)params.router_sink_size, kv_len);
+      }
+      const uint32_t q_tile_start = (qo_tile_idx * CTA_TILE_Q) / group_size;
+      router_aha_recent_start =
+          sub_if_greater_or_zero(kv_len + q_tile_start, qo_len + router_window_left);
+      const uint32_t q_tile_last = qo_upper_bound > 0 ? qo_upper_bound - 1 : q_tile_start;
+      router_aha_recent_full_start =
+          sub_if_greater_or_zero(kv_len + q_tile_last, qo_len + router_window_left);
+      if (router_aha_sink_size == 0) {
+        window_left = router_window_left;
       }
     }
     bool force_logits_mask_every_iter = false;
@@ -2654,6 +2671,72 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
   BatchPrefillWithPagedKVCacheDevice<KTraits>(params, smem_storage);
 }
 
+template <uint32_t CTA_TILE_Q, typename AttentionVariant, typename Params>
+__global__ void BuildAhaPrefillRouterTileStateKernel(const __grid_constant__ Params params,
+                                                     uint32_t num_kv_heads) {
+  using IdType = typename Params::IdType;
+  const uint32_t bx = blockIdx.x, kv_head_idx = blockIdx.y, lane_idx = threadIdx.x;
+  if constexpr (has_maybe_router_tile_state_v<Params> && has_maybe_router_v<Params>) {
+    if (params.maybe_router_tile_state == nullptr || params.maybe_router == nullptr) {
+      return;
+    }
+    if (params.block_valid_mask && !params.block_valid_mask[bx]) {
+      return;
+    }
+    const uint32_t kv_tile_idx = params.kv_tile_indices[bx];
+    if (kv_tile_idx != 0) {
+      return;
+    }
+    bool is_aha_gate = AttentionVariant::use_aha_router;
+    if constexpr (!AttentionVariant::use_aha_router && has_router_is_aha_gate_v<Params>) {
+      is_aha_gate = params.router_is_aha_gate;
+    }
+    if (!is_aha_gate) {
+      if (lane_idx == 0) {
+        params.maybe_router_tile_state[static_cast<uint64_t>(bx) * num_kv_heads + kv_head_idx] =
+            kAhaRouterTileMixed;
+      }
+      return;
+    }
+
+    uint64_t router_stride_n = num_kv_heads;
+    uint64_t router_stride_h = 1;
+    if constexpr (has_router_stride_n_v<Params>) {
+      router_stride_n = static_cast<uint64_t>(params.router_stride_n);
+    }
+    if constexpr (has_router_stride_h_v<Params>) {
+      router_stride_h = static_cast<uint64_t>(params.router_stride_h);
+    }
+
+    const IdType request_idx = params.request_indices[bx];
+    const IdType qo_tile_idx = params.qo_tile_indices[bx];
+    const uint32_t qo_len = params.get_qo_len(request_idx);
+    const uint32_t q_tile_start = (qo_tile_idx * CTA_TILE_Q) / params.group_size;
+    const uint32_t qo_upper_bound =
+        min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, params.group_size));
+    bool lane_all_local = q_tile_start < qo_upper_bound;
+    bool lane_all_full = q_tile_start < qo_upper_bound;
+    for (uint32_t q_idx = q_tile_start + lane_idx; q_idx < qo_upper_bound; q_idx += WARP_SIZE) {
+      const uint8_t route_value =
+          params.maybe_router[static_cast<uint64_t>(params.q_indptr[request_idx] + q_idx) *
+                                  router_stride_n +
+                              static_cast<uint64_t>(kv_head_idx) * router_stride_h];
+      if (route_value != static_cast<uint8_t>(0)) {
+        lane_all_local = false;
+      } else {
+        lane_all_full = false;
+      }
+    }
+    const bool tile_all_local = __all_sync(0xffffffff, lane_all_local);
+    const bool tile_all_full = __all_sync(0xffffffff, lane_all_full);
+    if (lane_idx == 0) {
+      params.maybe_router_tile_state[static_cast<uint64_t>(bx) * num_kv_heads + kv_head_idx] =
+          tile_all_local ? kAhaRouterTileAllLocal
+                         : (tile_all_full ? kAhaRouterTileAllFull : kAhaRouterTileMixed);
+    }
+  }
+}
+
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
@@ -2895,6 +2978,19 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
         params.lse = tmp_s;
         params.o_stride_n = num_qo_heads * HEAD_DIM_VO;
         params.o_stride_h = HEAD_DIM_VO;
+        if constexpr (has_maybe_router_tile_state_v<Params> && has_maybe_router_v<Params>) {
+          bool build_router_tile_state =
+              params.maybe_router != nullptr && params.maybe_router_tile_state != nullptr;
+          if constexpr (!AttentionVariant::use_aha_router && has_router_is_aha_gate_v<Params>) {
+            build_router_tile_state = build_router_tile_state && params.router_is_aha_gate;
+          }
+          if (build_router_tile_state) {
+            dim3 router_nblks(padded_batch_size, num_kv_heads);
+            BuildAhaPrefillRouterTileStateKernel<CTA_TILE_Q, AttentionVariant, Params>
+                <<<router_nblks, WARP_SIZE, 0, stream>>>(params, num_kv_heads);
+            FLASHINFER_CUDA_CALL(cudaGetLastError());
+          }
+        }
         if (enable_pdl) {
           FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
         } else {
