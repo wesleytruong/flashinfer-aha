@@ -2306,11 +2306,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         (chunk_size == 0 ||
          (chunk_start >= router_aha_sink_size && chunk_end <= router_aha_recent_start));
     if (router_aha_chunk_empty) {
-      const uint32_t num_kv_chunks = ceil_div(kv_len_safe, kv_chunk_size);
-      write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
-                                /*o_stride_n=*/num_kv_chunks * o_stride_n,
-                                /*o_stride_h=*/o_stride_h, group_size, tid);
-      if constexpr (variant.use_softmax) {
+      if constexpr (variant.use_softmax && MASK_MODE == MaskMode::kCausal) {
+        // Causal AHA prefill sparse merge does not read middle local chunks,
+        // so writing a zero partial state and -inf LSE here is pure memory
+        // traffic.
+      } else {
+        const uint32_t num_kv_chunks = ceil_div(kv_len_safe, kv_chunk_size);
+        write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
+                                  /*o_stride_n=*/num_kv_chunks * o_stride_n,
+                                  /*o_stride_h=*/o_stride_h, group_size, tid);
         if (lse != nullptr && get_warp_idx_kv<KTraits>(tid.z) == 0) {
 #pragma unroll
           for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
@@ -3024,9 +3028,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
             router_sink_size = static_cast<uint32_t>(params.router_sink_size);
           }
           const bool decode_like = params.max_total_num_rows == params.paged_kv.batch_size;
-          const bool run_aha_router_merge =
-              use_aha_router_merge && router_sink_size != 0 && decode_like;
-          if (run_aha_router_merge) {
+          if (use_aha_router_merge && decode_like) {
             FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStridedAhaDecodeRouter(
                 tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
                 params.total_num_rows, num_qo_heads, HEAD_DIM_VO, final_o_stride_n,
@@ -3035,6 +3037,15 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                 static_cast<uint32_t>(params.paged_kv.page_size), params.kv_chunk_size_ptr,
                 num_qo_heads / num_kv_heads, params.window_left, router_sink_size, enable_pdl,
                 stream));
+          } else if (use_aha_router_merge && MASK_MODE == MaskMode::kCausal) {
+            FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStridedAhaPrefillRouter(
+                tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
+                params.total_num_rows, num_qo_heads, HEAD_DIM_VO, final_o_stride_n,
+                final_o_stride_h, aha_router_ptr, router_stride_n, router_stride_h, params.q_indptr,
+                static_cast<uint32_t>(params.paged_kv.batch_size), params.paged_kv.indptr,
+                params.paged_kv.last_page_len, static_cast<uint32_t>(params.paged_kv.page_size),
+                params.kv_chunk_size_ptr, num_qo_heads / num_kv_heads, params.window_left,
+                router_sink_size, enable_pdl, stream));
           } else {
             FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStrided(
                 tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,

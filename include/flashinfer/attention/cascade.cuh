@@ -612,6 +612,180 @@ __global__ void PersistentVariableLengthMergeStatesAhaDecodeRouterKernel(
 #endif
 }
 
+template <typename IdType>
+__device__ __forceinline__ uint32_t FindRequestIdxFromQIndptr(const IdType* __restrict__ q_indptr,
+                                                              uint32_t batch_size,
+                                                              uint32_t pos) {
+  uint32_t lo = 0;
+  uint32_t hi = batch_size;
+  while (lo + 1 < hi) {
+    const uint32_t mid = (lo + hi) >> 1;
+    if (static_cast<uint32_t>(q_indptr[mid]) <= pos) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages,
+          typename DTypeIn, typename DTypeO, typename IdType>
+__global__ void PersistentVariableLengthMergeStatesAhaPrefillRouterKernel(
+    DTypeIn* __restrict__ V, float* __restrict__ S, IdType* indptr, DTypeO* __restrict__ v_merged,
+    float* __restrict__ s_merged, uint32_t max_seq_len, uint32_t* __restrict__ seq_len_ptr,
+    uint32_t num_heads, uint32_t o_stride_n, uint32_t o_stride_h,
+    const uint8_t* __restrict__ router, uint64_t router_stride_n, uint64_t router_stride_h,
+    const IdType* __restrict__ q_indptr, uint32_t batch_size,
+    const IdType* __restrict__ kv_indptr, const IdType* __restrict__ kv_last_page_len,
+    uint32_t page_size,
+    const IdType* __restrict__ kv_chunk_size_ptr, uint32_t group_size, int32_t window_left,
+    uint32_t router_sink_size) {
+  uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t cta_id = blockIdx.x;
+  uint32_t num_ctas = gridDim.x;
+  const uint32_t seq_len = seq_len_ptr ? *seq_len_ptr : max_seq_len;
+  constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
+  constexpr uint32_t head_dim = vec_size * bdx;
+  extern __shared__ uint8_t smem[];
+  DTypeIn* v_smem = (DTypeIn*)smem;
+  float* s_smem = (float*)(smem + num_smem_stages * bdy * head_dim * sizeof(DTypeIn));
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
+#pragma unroll 1
+  for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
+    __syncthreads();
+
+    const uint32_t pos = i / num_heads;
+    const uint32_t head_idx = i % num_heads;
+    const uint32_t indptr_begin = indptr[pos];
+    const uint32_t full_num_index_sets = indptr[pos + 1] - indptr_begin;
+
+    const uint32_t request_idx =
+        batch_size == 1 ? 0 : FindRequestIdxFromQIndptr(q_indptr, batch_size, pos);
+    const uint32_t q_idx = pos - static_cast<uint32_t>(q_indptr[request_idx]);
+    const uint32_t qo_len =
+        static_cast<uint32_t>(q_indptr[request_idx + 1] - q_indptr[request_idx]);
+    const uint32_t kv_head_idx = head_idx / group_size;
+    const bool head_uses_full =
+        router == nullptr ||
+        router[static_cast<uint64_t>(pos) * router_stride_n +
+               static_cast<uint64_t>(kv_head_idx) * router_stride_h] != static_cast<uint8_t>(0);
+
+    uint32_t prefix_chunks = 0;
+    uint32_t recent_first_chunk = full_num_index_sets;
+    uint32_t end_chunk = full_num_index_sets;
+    uint32_t num_index_sets = full_num_index_sets;
+    const uint32_t kv_chunk_size = static_cast<uint32_t>(*kv_chunk_size_ptr);
+    const uint32_t num_pages = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
+    const uint32_t kv_len =
+        num_pages == 0 ? 0 : (num_pages - 1) * page_size + kv_last_page_len[request_idx];
+    const uint32_t kv_len_init = kv_len > qo_len ? kv_len - qo_len : 0;
+    const uint32_t causal_end = min(kv_len, kv_len_init + q_idx + 1);
+    end_chunk = min(ceil_div(causal_end, kv_chunk_size), full_num_index_sets);
+    num_index_sets = end_chunk;
+
+    if (!head_uses_full) {
+      const uint32_t local_window =
+          window_left < 0 ? kv_len : static_cast<uint32_t>(window_left) + 1;
+      const uint32_t sink_size = min(router_sink_size, causal_end);
+      const uint32_t recent_start = sub_if_greater_or_zero(causal_end, local_window);
+      prefix_chunks = min(ceil_div(sink_size, kv_chunk_size), end_chunk);
+      recent_first_chunk = min(recent_start / kv_chunk_size, end_chunk);
+      recent_first_chunk = max(recent_first_chunk, prefix_chunks);
+      num_index_sets = prefix_chunks + (end_chunk - recent_first_chunk);
+    }
+
+    auto logical_index_to_partial_offset = [&](uint32_t logical_idx) {
+      if (logical_idx >= num_index_sets) {
+        return indptr_begin;
+      }
+      uint32_t chunk_idx = logical_idx;
+      if (!head_uses_full && logical_idx >= prefix_chunks) {
+        chunk_idx = recent_first_chunk + (logical_idx - prefix_chunks);
+      }
+      return indptr_begin + chunk_idx;
+    };
+
+    state_t<vec_size> st;
+
+    if (num_index_sets == 0) {
+      vec_t<DTypeO, vec_size> v;
+      v.fill(DTypeO(0.f));
+      v.store(v_merged + pos * o_stride_n + head_idx * o_stride_h + tx * vec_size);
+      if (s_merged != nullptr) {
+        s_merged[pos * num_heads + head_idx] = -math::inf;
+      }
+      continue;
+    }
+
+    if (num_index_sets == 1) {
+      vec_t<DTypeO, vec_size> v;
+      const uint32_t partial_offset = logical_index_to_partial_offset(0);
+      v.cast_load(V + (partial_offset * num_heads + head_idx) * head_dim + tx * vec_size);
+      v.store(v_merged + pos * o_stride_n + head_idx * o_stride_h + tx * vec_size);
+      if (s_merged != nullptr) {
+        s_merged[pos * num_heads + head_idx] = S[partial_offset * num_heads + head_idx];
+      }
+      continue;
+    }
+
+#pragma unroll
+    for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {
+      const uint32_t logical_idx = iter * bdy + ty;
+      const uint32_t partial_offset = logical_index_to_partial_offset(logical_idx);
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+          v_smem + (iter * bdy + ty) * head_dim + tx * vec_size,
+          V + (partial_offset * num_heads + head_idx) * head_dim + tx * vec_size,
+          logical_idx < num_index_sets);
+      cp_async::commit_group();
+    }
+#pragma unroll 4
+    for (uint32_t iter = 0; iter < ceil_div(num_index_sets, bdy); ++iter) {
+      if (iter % bdx == 0) {
+        const uint32_t logical_idx = iter * bdy + ty * bdx + tx;
+        const uint32_t partial_offset = logical_index_to_partial_offset(logical_idx);
+        s_smem[ty * bdx + tx] =
+            logical_idx < num_index_sets ? S[partial_offset * num_heads + head_idx] : 0.f;
+        __syncthreads();
+      }
+      cp_async::wait_group<num_smem_stages - 1>();
+      __syncthreads();
+      vec_t<float, vec_size> v;
+      v.cast_load(v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size);
+      if (iter * bdy + ty < num_index_sets) {
+        float s = s_smem[(iter % bdx) * bdy + ty];
+        st.merge(v, s, 1);
+      }
+      __syncthreads();
+      const uint32_t next_logical_idx = (iter + num_smem_stages) * bdy + ty;
+      const uint32_t next_partial_offset = logical_index_to_partial_offset(next_logical_idx);
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+          v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size,
+          V + (next_partial_offset * num_heads + head_idx) * head_dim + tx * vec_size,
+          next_logical_idx < num_index_sets);
+      cp_async::commit_group();
+    }
+    cp_async::wait_group<0>();
+    __syncthreads();
+
+    st.normalize();
+    threadblock_sync_state<bdx, bdy, vec_size>(st, v_smem, s_smem);
+    st.normalize();
+
+    st.o.cast_store(v_merged + pos * o_stride_n + head_idx * o_stride_h + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[pos * num_heads + head_idx] = st.get_lse();
+    }
+  }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
           typename DTypeO, typename IdType>
 __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__ V, IdType* indptr,
@@ -956,6 +1130,85 @@ cudaError_t VariableLengthMergeStatesStridedAhaDecodeRouter(
           &config, kernel, v, s, indptr, v_merged, s_merged, max_seq_len, seq_len, num_heads,
           o_stride_n, o_stride_h, router, router_stride_n, router_stride_h, kv_indptr,
           kv_last_page_len, page_size, kv_chunk_size_ptr, group_size, window_left, router_sink_size));
+    } else {
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    }
+  });
+  return cudaSuccess;
+}
+
+template <typename DTypeIn, typename DTypeO, typename IdType>
+cudaError_t VariableLengthMergeStatesStridedAhaPrefillRouter(
+    DTypeIn* v, float* s, IdType* indptr, DTypeO* v_merged, float* s_merged,
+    uint32_t max_seq_len, uint32_t* seq_len, uint32_t num_heads, uint32_t head_dim,
+    uint32_t o_stride_n, uint32_t o_stride_h, const uint8_t* router, uint64_t router_stride_n,
+    uint64_t router_stride_h, const IdType* q_indptr, uint32_t batch_size,
+    const IdType* kv_indptr, const IdType* kv_last_page_len, uint32_t page_size,
+    const IdType* kv_chunk_size_ptr, uint32_t group_size, int32_t window_left,
+    uint32_t router_sink_size, bool enable_pdl, cudaStream_t stream = nullptr) {
+  int dev_id = 0;
+  int num_sms = 0;
+  int num_blocks_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+    constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+    constexpr uint32_t bdx = HEAD_DIM / vec_size;
+    constexpr uint32_t num_threads = 128;
+    constexpr uint32_t bdy = num_threads / bdx;
+    constexpr uint32_t num_smem_stages = 4;
+    uint32_t smem_size =
+        num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
+    auto kernel = PersistentVariableLengthMergeStatesAhaPrefillRouterKernel<
+        vec_size, bdx, bdy, num_smem_stages, DTypeIn, DTypeO, IdType>;
+    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                                                       num_threads, smem_size));
+    num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(max_seq_len * num_heads, num_sms));
+
+    dim3 nblks(num_sms * num_blocks_per_sm);
+    dim3 nthrs(bdx, bdy);
+    void* args[] = {&v,
+                    &s,
+                    &indptr,
+                    &v_merged,
+                    &s_merged,
+                    &max_seq_len,
+                    &seq_len,
+                    &num_heads,
+                    &o_stride_n,
+                    &o_stride_h,
+                    &router,
+                    &router_stride_n,
+                    &router_stride_h,
+                    &q_indptr,
+                    &batch_size,
+                    &kv_indptr,
+                    &kv_last_page_len,
+                    &page_size,
+                    &kv_chunk_size_ptr,
+                    &group_size,
+                    &window_left,
+                    &router_sink_size};
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    if (enable_pdl) {
+      cudaLaunchAttribute attribute[1];
+      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attribute[0].val.programmaticStreamSerializationAllowed = 1;
+      cudaLaunchConfig_t config;
+      config.attrs = attribute;
+      config.numAttrs = 1;
+      config.gridDim = nblks;
+      config.blockDim = nthrs;
+      config.dynamicSmemBytes = smem_size;
+      config.stream = stream;
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+          &config, kernel, v, s, indptr, v_merged, s_merged, max_seq_len, seq_len, num_heads,
+          o_stride_n, o_stride_h, router, router_stride_n, router_stride_h, q_indptr, batch_size,
+          kv_indptr, kv_last_page_len, page_size, kv_chunk_size_ptr, group_size, window_left,
+          router_sink_size));
     } else {
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
     }
