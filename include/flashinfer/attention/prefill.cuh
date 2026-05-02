@@ -2295,6 +2295,16 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                     ceil_div(chunk_size, CTA_TILE_KV));
       router_aha_recent_iteration = max(router_aha_recent_iteration, router_aha_prefix_iterations);
     }
+    const bool router_aha_chunk_empty =
+        partition_kv && router_aha_q_tile_all_local &&
+        (chunk_size == 0 ||
+         (chunk_start >= router_aha_sink_size && chunk_end <= router_aha_recent_start));
+    if (decode_like && router_aha_chunk_empty) {
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+      asm volatile("griddepcontrol.launch_dependents;");
+#endif
+      return;
+    }
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
     DTypeQKAccum m[NUM_MMA_Q][2];
@@ -2329,10 +2339,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     asm volatile("griddepcontrol.wait;");
 #endif
 
-    const bool router_aha_chunk_empty =
-        partition_kv && router_aha_q_tile_all_local &&
-        (chunk_size == 0 ||
-         (chunk_start >= router_aha_sink_size && chunk_end <= router_aha_recent_start));
     if (router_aha_chunk_empty) {
       if constexpr (AttentionVariant::use_softmax) {
         if (!decode_like && MASK_MODE != MaskMode::kCausal) {
