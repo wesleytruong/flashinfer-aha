@@ -1861,7 +1861,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     const uint32_t qo_packed_idx_base =
         (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<KTraits>(tid.y)) * NUM_MMA_Q * 16;
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
-    const uint32_t o_stride_n = num_qo_heads * HEAD_DIM_VO, o_stride_h = HEAD_DIM_VO;
+    const uint32_t o_stride_n =
+        params.o_stride_n == 0 ? num_qo_heads * HEAD_DIM_VO : params.o_stride_n;
+    const uint32_t o_stride_h = params.o_stride_h == 0 ? HEAD_DIM_VO : params.o_stride_h;
 
     DTypeQ* q_ptr_base =
         q + q_indptr[request_idx] * q_stride_n + kv_head_idx * group_size * q_stride_h;
@@ -2253,7 +2255,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<KTraits>(tid.y)) * NUM_MMA_Q * 16;
     const uint32_t q_stride_n = params.q_stride_n, q_stride_h = params.q_stride_h;
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
-    const uint32_t o_stride_n = num_qo_heads * HEAD_DIM_VO, o_stride_h = HEAD_DIM_VO;
+    const uint32_t o_stride_n =
+        params.o_stride_n == 0 ? num_qo_heads * HEAD_DIM_VO : params.o_stride_n;
+    const uint32_t o_stride_h = params.o_stride_h == 0 ? HEAD_DIM_VO : params.o_stride_h;
 
     DTypeQ* q_ptr_base =
         q + q_indptr[request_idx] * q_stride_n + (kv_head_idx * group_size) * q_stride_h;
@@ -2705,8 +2709,14 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
         params.partition_kv = true;
         auto o = params.o;
         auto lse = params.lse;
+        const uint32_t final_o_stride_n =
+            params.o_stride_n == 0 ? num_qo_heads * HEAD_DIM_VO : params.o_stride_n;
+        const uint32_t final_o_stride_h =
+            params.o_stride_h == 0 ? HEAD_DIM_VO : params.o_stride_h;
         params.o = tmp_v;
         params.lse = tmp_s;
+        params.o_stride_n = num_qo_heads * HEAD_DIM_VO;
+        params.o_stride_h = HEAD_DIM_VO;
         void* args[] = {(void*)&params};
         if (enable_pdl) {
           FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
@@ -2715,13 +2725,14 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         }
         if constexpr (AttentionVariant::use_softmax) {
-          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+          FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStrided(
               tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, final_o_stride_n,
+              final_o_stride_h, enable_pdl, stream));
         } else {
-          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
+          FLASHINFER_CUDA_CALL(VariableLengthAttentionSumStrided(
               tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
-              num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+              num_qo_heads, HEAD_DIM_VO, final_o_stride_n, final_o_stride_h, enable_pdl, stream));
         }
       }
     }
@@ -2830,8 +2841,14 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
         params.partition_kv = true;
         auto o = params.o;
         auto lse = params.lse;
+        const uint32_t final_o_stride_n =
+            params.o_stride_n == 0 ? num_qo_heads * HEAD_DIM_VO : params.o_stride_n;
+        const uint32_t final_o_stride_h =
+            params.o_stride_h == 0 ? HEAD_DIM_VO : params.o_stride_h;
         params.o = tmp_v;
         params.lse = tmp_s;
+        params.o_stride_n = num_qo_heads * HEAD_DIM_VO;
+        params.o_stride_h = HEAD_DIM_VO;
         if (enable_pdl) {
           FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
         } else {
@@ -2840,13 +2857,14 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         }
         if constexpr (AttentionVariant::use_softmax) {
-          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+          FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStrided(
               tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, final_o_stride_n,
+              final_o_stride_h, enable_pdl, stream));
         } else {
-          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
+          FLASHINFER_CUDA_CALL(VariableLengthAttentionSumStrided(
               tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
-              num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+              num_qo_heads, HEAD_DIM_VO, final_o_stride_n, final_o_stride_h, enable_pdl, stream));
         }
       }
     }

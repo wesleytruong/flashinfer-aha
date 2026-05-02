@@ -45,6 +45,8 @@ struct SinglePrefillParams {
   uint32_t num_kv_heads;
   uint32_t q_stride_n;
   uint32_t q_stride_h;
+  uint32_t o_stride_n;
+  uint32_t o_stride_h;
   uint32_t k_stride_n;
   uint32_t k_stride_h;
   uint32_t v_stride_n;
@@ -73,6 +75,8 @@ struct SinglePrefillParams {
         num_kv_heads(0),
         q_stride_n(0),
         q_stride_h(0),
+        o_stride_n(0),
+        o_stride_h(0),
         k_stride_n(0),
         k_stride_h(0),
         v_stride_n(0),
@@ -106,6 +110,8 @@ struct SinglePrefillParams {
         kv_len(kv_len),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),
+        o_stride_n(num_qo_heads * head_dim),
+        o_stride_h(head_dim),
         k_stride_n(kv_stride_n),
         k_stride_h(kv_stride_h),
         v_stride_n(kv_stride_n),
@@ -151,6 +157,8 @@ struct BatchPrefillRaggedParams {
   uint32_t num_kv_heads;
   uint32_t q_stride_n;
   uint32_t q_stride_h;
+  uint32_t o_stride_n;
+  uint32_t o_stride_h;
   uint32_t k_stride_n;
   uint32_t k_stride_h;
   uint32_t v_stride_n;
@@ -195,6 +203,8 @@ struct BatchPrefillRaggedParams {
         num_kv_heads(0),
         q_stride_n(0),
         q_stride_h(0),
+        o_stride_n(0),
+        o_stride_h(0),
         k_stride_n(0),
         k_stride_h(0),
         v_stride_n(0),
@@ -246,6 +256,8 @@ struct BatchPrefillRaggedParams {
         num_kv_heads(num_kv_heads),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),
+        o_stride_n(0),
+        o_stride_h(0),
         k_stride_n(kv_stride_n),
         k_stride_h(kv_stride_h),
         v_stride_n(kv_stride_n),
@@ -300,6 +312,8 @@ struct BatchPrefillPagedParams {
   uint32_t num_qo_heads;
   IdType q_stride_n;
   IdType q_stride_h;
+  IdType o_stride_n;
+  IdType o_stride_h;
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
@@ -336,6 +350,8 @@ struct BatchPrefillPagedParams {
         num_qo_heads(0),
         q_stride_n(0),
         q_stride_h(0),
+        o_stride_n(0),
+        o_stride_h(0),
         window_left(0),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
@@ -377,6 +393,8 @@ struct BatchPrefillPagedParams {
         num_qo_heads(num_qo_heads),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),
+        o_stride_n(0),
+        o_stride_h(0),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
