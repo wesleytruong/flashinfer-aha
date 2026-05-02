@@ -2168,9 +2168,19 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         if constexpr (!AttentionVariant::use_aha_router && has_router_is_aha_gate_v<Params>) {
           is_aha_gate = params.router_is_aha_gate;
         }
-        if (is_aha_gate ||
-            !params.maybe_router[static_cast<uint64_t>(request_idx) * router_stride_n +
-                                 static_cast<uint64_t>(kv_head_idx) * router_stride_h]) {
+        const uint8_t route_value =
+            params.maybe_router[static_cast<uint64_t>(request_idx) * router_stride_n +
+                                static_cast<uint64_t>(kv_head_idx) * router_stride_h];
+        const bool decode_like = params.max_total_num_rows == params.paged_kv.batch_size;
+        uint32_t route_sink_size = 0;
+        if constexpr (has_router_sink_size_v<Params>) {
+          route_sink_size = static_cast<uint32_t>(params.router_sink_size);
+        }
+        const bool head_uses_full =
+            is_aha_gate ? (!decode_like || route_sink_size != 0 ||
+                           route_value != static_cast<uint8_t>(0))
+                        : (route_value == static_cast<uint8_t>(0));
+        if (head_uses_full) {
           window_left = kv_len;
         }
       }
@@ -2197,10 +2207,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       }
     }
     if constexpr (has_maybe_router_v<Params>) {
-      if constexpr (has_router_is_aha_gate_v<Params>) {
-        if (params.maybe_router != nullptr &&
-            (AttentionVariant::use_aha_router || params.router_is_aha_gate) &&
-            !router_aha_tile_state_loaded) {
+      if constexpr (AttentionVariant::use_aha_router || has_router_is_aha_gate_v<Params>) {
+        bool is_aha_gate = AttentionVariant::use_aha_router;
+        if constexpr (!AttentionVariant::use_aha_router && has_router_is_aha_gate_v<Params>) {
+          is_aha_gate = params.router_is_aha_gate;
+        }
+        if (params.maybe_router != nullptr && is_aha_gate && !router_aha_tile_state_loaded) {
           const uint32_t q_tile_start = (qo_tile_idx * CTA_TILE_Q) / group_size;
           bool lane_q_tile_all_local = q_tile_start < qo_upper_bound;
           bool lane_q_tile_all_full = q_tile_start < qo_upper_bound;
@@ -2237,12 +2249,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     }
     bool force_logits_mask_every_iter = false;
     if constexpr (has_maybe_router_v<Params>) {
-      if constexpr (has_router_is_aha_gate_v<Params>) {
-        force_logits_mask_every_iter =
-            params.maybe_router != nullptr &&
-            (AttentionVariant::use_aha_router || params.router_is_aha_gate) &&
-            !router_aha_q_tile_all_full &&
-            !(router_aha_q_tile_all_local && router_aha_sink_size == 0);
+      if constexpr (AttentionVariant::use_aha_router || has_router_is_aha_gate_v<Params>) {
+        bool is_aha_gate = AttentionVariant::use_aha_router;
+        if constexpr (!AttentionVariant::use_aha_router && has_router_is_aha_gate_v<Params>) {
+          is_aha_gate = params.router_is_aha_gate;
+        }
+        force_logits_mask_every_iter = params.maybe_router != nullptr && is_aha_gate &&
+                                       !router_aha_q_tile_all_full &&
+                                       !(router_aha_q_tile_all_local &&
+                                         router_aha_sink_size == 0);
       }
     }
 
@@ -2982,6 +2997,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
         params.lse = tmp_s;
         params.o_stride_n = num_qo_heads * HEAD_DIM_VO;
         params.o_stride_h = HEAD_DIM_VO;
+        const bool decode_like = params.max_total_num_rows == params.paged_kv.batch_size;
         if constexpr (has_maybe_router_tile_state_v<Params> && has_maybe_router_v<Params>) {
           bool build_router_tile_state =
               params.maybe_router != nullptr && params.maybe_router_tile_state != nullptr;
@@ -3027,7 +3043,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
           if constexpr (has_router_sink_size_v<Params>) {
             router_sink_size = static_cast<uint32_t>(params.router_sink_size);
           }
-          const bool decode_like = params.max_total_num_rows == params.paged_kv.batch_size;
           if (use_aha_router_merge && decode_like) {
             FLASHINFER_CUDA_CALL(VariableLengthMergeStatesStridedAhaDecodeRouter(
                 tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,

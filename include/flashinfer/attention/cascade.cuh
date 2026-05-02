@@ -519,10 +519,22 @@ __global__ void PersistentVariableLengthMergeStatesAhaDecodeRouterKernel(
           window_left < 0 ? kv_len : static_cast<uint32_t>(window_left) + 1;
       const uint32_t sink_size = min(router_sink_size, kv_len);
       const uint32_t recent_start = sub_if_greater_or_zero(kv_len, local_window);
-      prefix_chunks = min(ceil_div(sink_size, kv_chunk_size), full_num_index_sets);
-      recent_first_chunk = min(recent_start / kv_chunk_size, full_num_index_sets);
-      recent_first_chunk = max(recent_first_chunk, prefix_chunks);
-      num_index_sets = prefix_chunks + (full_num_index_sets - recent_first_chunk);
+      if (sink_size == 0) {
+        // The AHA tensor-core decode path runs through the batch-prefill
+        // partition-kv kernel. For pure-local heads it computes the recent
+        // window as a compact range starting at partial chunk 0, so the merge
+        // step must read those compact chunks instead of the full-KV tail
+        // chunk ids.
+        prefix_chunks = 0;
+        recent_first_chunk = 0;
+        num_index_sets = min(ceil_div(min(local_window, kv_len), kv_chunk_size),
+                             full_num_index_sets);
+      } else {
+        prefix_chunks = min(ceil_div(sink_size, kv_chunk_size), full_num_index_sets);
+        recent_first_chunk = min(recent_start / kv_chunk_size, full_num_index_sets);
+        recent_first_chunk = max(recent_first_chunk, prefix_chunks);
+        num_index_sets = prefix_chunks + (full_num_index_sets - recent_first_chunk);
+      }
     }
 
     auto logical_index_to_partial_offset = [&](uint32_t logical_idx) {
