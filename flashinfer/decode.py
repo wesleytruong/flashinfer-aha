@@ -2748,6 +2748,10 @@ def fast_decode_plan(
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
 
+    plan_window_left = (
+        -1 if getattr(self, "_use_router", False) else window_left
+    )
+
     # Handle data types consistently
     if data_type is not None:
         if q_data_type is None:
@@ -2844,7 +2848,7 @@ def fast_decode_plan(
                     head_dim,
                     head_dim,
                     False,  # causal
-                    window_left,
+                    plan_window_left,
                 ]
                 if self._backend == "fa2":
                     args.append(fixed_split_size)
@@ -2868,7 +2872,7 @@ def fast_decode_plan(
                     num_kv_heads,
                     page_size,
                     self.is_cuda_graph_enabled,
-                    window_left,
+                    plan_window_left,
                     logits_soft_cap,
                     head_dim,
                     head_dim,

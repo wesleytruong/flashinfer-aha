@@ -2156,12 +2156,42 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
     const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
+    const uint32_t qo_len = params.get_qo_len(request_idx);
+    const uint32_t kv_len = params.get_kv_len(request_idx);
+    const bool decode_like = params.max_total_num_rows == params.paged_kv.batch_size;
+    if constexpr (has_maybe_router_v<Params>) {
+      if (params.maybe_router != nullptr && decode_like && partition_kv) {
+        bool is_aha_gate = AttentionVariant::use_aha_router;
+        if constexpr (!AttentionVariant::use_aha_router && has_router_is_aha_gate_v<Params>) {
+          is_aha_gate = params.router_is_aha_gate;
+        }
+        uint32_t route_sink_size = 0;
+        if constexpr (has_router_sink_size_v<Params>) {
+          route_sink_size = static_cast<uint32_t>(params.router_sink_size);
+        }
+        const uint8_t route_value =
+            params.maybe_router[static_cast<uint64_t>(request_idx) * router_stride_n +
+                                static_cast<uint64_t>(kv_head_idx) * router_stride_h];
+        if (is_aha_gate && route_sink_size == 0 && route_value == static_cast<uint8_t>(0)) {
+          const uint32_t local_window_left =
+              params.window_left >= 0 ? static_cast<uint32_t>(params.window_left) : kv_len;
+          const uint32_t kv_start_idx =
+              sub_if_greater_or_zero(kv_len + (qo_tile_idx * CTA_TILE_Q) / group_size,
+                                     qo_len + local_window_left);
+          const uint32_t chunk_start = min(kv_tile_idx * kv_chunk_size + kv_start_idx, kv_len);
+          if (chunk_start >= kv_len) {
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+            asm volatile("griddepcontrol.launch_dependents;");
+#endif
+            return;
+          }
+        }
+      }
+    }
     auto smem = reinterpret_cast<uint8_t*>(&smem_storage);
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
-    const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len;
     uint32_t window_left = variant.window_left;
     const uint32_t router_window_left = window_left;
-    const bool decode_like = params.max_total_num_rows == params.paged_kv.batch_size;
     bool decode_like_aha_tile_state_valid = false;
     bool decode_like_aha_q_tile_all_local = false;
     bool decode_like_aha_q_tile_all_full = false;
