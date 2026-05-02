@@ -2306,7 +2306,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         partition_kv && router_aha_q_tile_all_local &&
         (chunk_size == 0 ||
          (chunk_start >= router_aha_sink_size && chunk_end <= router_aha_recent_start));
-    if (decode_like && router_aha_chunk_empty) {
+    const bool router_aha_plain_window_chunk_empty =
+        decode_like && partition_kv && router_aha_plain_window_local && chunk_size == 0;
+    if (decode_like && (router_aha_chunk_empty || router_aha_plain_window_chunk_empty)) {
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
       asm volatile("griddepcontrol.launch_dependents;");
 #endif
