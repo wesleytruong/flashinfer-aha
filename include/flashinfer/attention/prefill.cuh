@@ -2122,6 +2122,33 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const uint32_t chunk_end =
         partition_kv ? min((kv_tile_idx + 1) * max_chunk_size + kv_start_idx, kv_len) : kv_len;
     const uint32_t chunk_size = chunk_end - chunk_start;
+#ifdef FLASHINFER_DEBUG_AHA_WINDOW
+    // AHA debug: print the window/router state the kernel actually sees (incl. under
+    // cudagraph replay). Enable via env FLASHINFER_DEBUG_AHA_WINDOW=1 + clear JIT cache.
+    // Fires for kv_head 0 across its first 12 split-KV chunks (kv_tile_idx) so you can
+    // verify that for a LOCAL head only chunk 0 has data (size~=window) and chunks 1+
+    // clamp EMPTY (size==0). If a local head's later chunks instead read a full
+    // [0,kv_len) range, that's the real bug. If params.window_left is -1 here, local
+    // heads get variant.window_left == kv_len -> no skip and full-attention output.
+    if (kv_head_idx == 0 && kv_tile_idx < 12 && tid.x == 0 && tid.y == 0 && tid.z == 0) {
+      int router_val = -1;
+      if constexpr (has_maybe_router_v<Params>) {
+        router_val = (params.maybe_router != nullptr)
+                         ? static_cast<int>(
+                               params.maybe_router[request_idx * num_kv_heads + kv_head_idx])
+                         : -2;
+      }
+      printf(
+          "[aha-window] req=%u kv_head=%u router=%d params.window_left=%d "
+          "variant.window_left=%u eff_window=%u kv_len=%u kv_start=%u chunk=[%u,%u) "
+          "size=%u partition_kv=%d\n",
+          request_idx, kv_head_idx, router_val, static_cast<int>(params.window_left),
+          static_cast<unsigned>(variant.window_left), static_cast<unsigned>(window_left),
+          static_cast<unsigned>(kv_len), static_cast<unsigned>(kv_start_idx),
+          static_cast<unsigned>(chunk_start), static_cast<unsigned>(chunk_end),
+          static_cast<unsigned>(chunk_size), static_cast<int>(partition_kv));
+    }
+#endif
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
     DTypeQKAccum m[NUM_MMA_Q][2];

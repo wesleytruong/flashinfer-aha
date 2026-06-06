@@ -1484,10 +1484,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     sinks,
                     skip_softmax_threshold_scale_factor,
                 ]
-                if self._use_router:
-                    run_args.append(router)
-
-            self._cached_module.paged_run(*run_args)
+            # NOTE: decode's tensor-core run_args tail is malformed relative to
+            # the prefill paged_run signature (extra paged_kv_cache, missing
+            # max_q_len/batch_size/cum_seq_lens) — harmless for fa2, which
+            # ignores those trtllm-gen-only params. But maybe_router IS used by
+            # fa2, so bind it by name to avoid landing in the wrong slot (which
+            # left params.maybe_router == nullptr -> illegal memory access).
+            if self._use_router:
+                self._cached_module.paged_run(*run_args, maybe_router=router)
+            else:
+                self._cached_module.paged_run(*run_args)
         else:
             # trtllm-gen does not need plan info
             if self._backend == "trtllm-gen" and self._plan_info is None:

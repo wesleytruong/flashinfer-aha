@@ -995,6 +995,11 @@ def gen_batch_prefill_module(
         use_router=use_router,
     )
 
+    # AHA debug: keep the printf-enabled build in a SEPARATE cache entry so toggling
+    # FLASHINFER_DEBUG_AHA_WINDOW does not collide with (or pollute) the normal module.
+    if os.environ.get("FLASHINFER_DEBUG_AHA_WINDOW", "0") == "1":
+        uri = uri + "_dbgahawin"
+
     # use `fp8_enabled` flag to use separate kernel template
     # this is used for fp8 tensor core computation
     # KV-only quant is not influenced by this flag
@@ -1633,7 +1638,15 @@ def gen_customize_batch_prefill_module(
 
         generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
-        return gen_jit_spec(uri, source_paths)
+        # AHA debug: env-gated printf of the per-head window/router state the kernel
+        # sees (see prefill.cuh FLASHINFER_DEBUG_AHA_WINDOW). Toggling the env var
+        # changes the compile flags -> new cache key -> recompile.
+        debug_cflags = (
+            ["-DFLASHINFER_DEBUG_AHA_WINDOW"]
+            if os.environ.get("FLASHINFER_DEBUG_AHA_WINDOW", "0") == "1"
+            else []
+        )
+        return gen_jit_spec(uri, source_paths, extra_cuda_cflags=debug_cflags)
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
         (additional_params_decl, additional_func_params, additional_params_setter) = (
