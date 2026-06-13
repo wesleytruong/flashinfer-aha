@@ -1,0 +1,30 @@
+/projects/bhdo/wtruong/AHA-Research/flashinfer-aha/flashinfer/testing/utils.py:1620: UserWarning: CUPTI is not installed. Try 'pip install -U cupti-python'. Falling back to CUDA events for benchmarking.
+  return bench_gpu_time_with_cupti(
+/projects/bhdo/wtruong/AHA-Research/flashinfer-aha/flashinfer/testing/utils.py:1620: UserWarning: CUPTI is not installed. Try 'pip install -U cupti-python'. Falling back to CUDA events for benchmarking.
+  return bench_gpu_time_with_cupti(
+
+========================================================================================================
+WINDOW SWEEP  |  batch=32 seq_len=128000 heads=16qo/16kv head_dim=128 page=16 kv_dtype=torch.bfloat16 tensor_cores=True
+========================================================================================================
+
+Absolute kernel time (µs, lower = better)
+  window |  plain_full |  all-global    mix@50%    mix@70%    mix@90%   all-local
+---------------------------------------------------------------------------------
+     128 |     8886.0u |     9415.5u    4561.9u    3006.2u    1939.2u       44.0u
+     512 |     8884.5u |     9426.8u    4651.6u    3048.1u    2414.4u       68.0u
+    2048 |     8899.5u |     9439.7u    4685.8u    3157.8u    2053.3u      176.2u
+    8192 |     8896.6u |     9424.8u    4928.3u    3453.1u    2806.2u      639.9u
+   32768 |     8877.6u |     9444.6u    5901.7u    4813.0u    4123.3u     2531.9u
+   65536 |     8898.1u |     9424.3u    7286.1u    6568.6u    5904.9u     4833.4u
+  128000 |     8895.7u |     9420.0u    9452.4u    9457.5u    9567.2u     9449.6u
+
+Speedup vs plain_full (higher = better)
+  window |  all-global   mix@50%   mix@70%   mix@90%  all-local
+---------------------------------------------------------------
+     128 |       0.94x     1.95x     2.96x     4.58x    202.10x
+     512 |       0.94x     1.91x     2.91x     3.68x    130.72x
+    2048 |       0.94x     1.90x     2.82x     4.33x     50.51x
+    8192 |       0.94x     1.81x     2.58x     3.17x     13.90x
+   32768 |       0.94x     1.50x     1.84x     2.15x      3.51x
+   65536 |       0.94x     1.22x     1.35x     1.51x      1.84x
+  128000 |       0.94x     0.94x     0.94x     0.93x      0.94x

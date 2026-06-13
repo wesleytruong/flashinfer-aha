@@ -1,0 +1,34 @@
+/projects/bhdo/wtruong/AHA-Research/flashinfer-aha/flashinfer/testing/utils.py:1620: UserWarning: CUPTI is not installed. Try 'pip install -U cupti-python'. Falling back to CUDA events for benchmarking.
+  return bench_gpu_time_with_cupti(
+/projects/bhdo/wtruong/AHA-Research/flashinfer-aha/flashinfer/testing/utils.py:1620: UserWarning: CUPTI is not installed. Try 'pip install -U cupti-python'. Falling back to CUDA events for benchmarking.
+  return bench_gpu_time_with_cupti(
+
+========================================================================================================
+BATCH SWEEP  |  seq_len=32768  window=128  heads=16qo/16kv  head_dim=128  bf16  tensor-core decode
+========================================================================================================
+
+Absolute kernel time (µs, lower = better)
+    batch |  plain_full |  all-global    mix@50%    mix@70%    mix@90%   all-local
+----------------------------------------------------------------------------------
+        1 |       93.5u |       93.6u      61.6u      52.2u      45.2u       16.1u
+        2 |      163.8u |      165.1u      99.8u      82.6u      73.4u       17.3u
+        4 |      305.1u |      307.9u     176.2u     143.7u     129.7u       18.2u
+        8 |      588.9u |      597.0u     326.9u     266.9u     239.6u       20.7u
+       16 |     1146.6u |     1163.0u     627.6u     513.1u     451.9u       20.8u
+       32 |     2292.1u |     2447.0u    1216.9u     805.4u     632.8u       35.2u
+       64 |     4552.7u |     4793.9u    2468.4u    1486.0u     710.8u       54.3u
+      128 |     9086.8u |     9081.9u    4687.7u    2876.8u    1051.6u       84.3u
+      256 |    18166.0u |    18152.3u    9184.3u    5653.8u    2181.0u      145.2u
+
+Speedup vs plain_full (higher = better)
+    batch |  all-global   mix@50%   mix@70%   mix@90%  all-local
+----------------------------------------------------------------
+        1 |       1.00x     1.52x     1.79x     2.07x      5.81x
+        2 |       0.99x     1.64x     1.98x     2.23x      9.46x
+        4 |       0.99x     1.73x     2.12x     2.35x     16.73x
+        8 |       0.99x     1.80x     2.21x     2.46x     28.45x
+       16 |       0.99x     1.83x     2.23x     2.54x     55.04x
+       32 |       0.94x     1.88x     2.85x     3.62x     65.06x
+       64 |       0.95x     1.84x     3.06x     6.40x     83.79x
+      128 |       1.00x     1.94x     3.16x     8.64x    107.77x
+      256 |       1.00x     1.98x     3.21x     8.33x    125.10x
