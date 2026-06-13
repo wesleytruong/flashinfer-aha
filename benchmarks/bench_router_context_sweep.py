@@ -105,8 +105,12 @@ def main():
                     help="Use the cuda-core decode kernel (default: tensor-core 3D split-KV path)")
     ap.add_argument("--mixed-fractions", type=float, nargs="+", default=[0.5, 0.7, 0.9],
                     help="Local-head fractions for the mixed-router columns")
+    # Extended to 1M for GH200 (120GB): at batch=8, 16/16 heads, head_dim 128, bf16 the
+    # KV is ~64MB/1k-tokens/batch-elem, so 1,048,576 tokens -> ~64GB. (5090 32GB topped
+    # out near 131072.) Top points OOM-skip gracefully if a config doesn't fit.
     ap.add_argument("--contexts", type=int, nargs="+",
-                    default=[2048, 4096, 8192, 16384, 32768, 65536, 131072])
+                    default=[2048, 4096, 8192, 16384, 32768, 65536, 131072,
+                             262144, 524288, 1048576])
     args = ap.parse_args()
 
     dt = torch.bfloat16 if args.kv_dtype == "bf16" else torch.float16

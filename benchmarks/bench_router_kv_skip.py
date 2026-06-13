@@ -61,15 +61,23 @@ def build_paged_kv(cfg: Config, device: str = "cuda:0"):
     q = torch.randn(
         cfg.batch_size, cfg.num_qo_heads, cfg.head_dim, dtype=cfg.q_dtype, device=device
     )
-    # NHD: [num_blocks, 2, page_size, num_kv_heads, head_dim]
+    # NHD: [num_blocks, 2, page_size, num_kv_heads, head_dim].
+    # Generate directly in the target dtype where randn supports it (bf16/fp16) so we
+    # don't transiently allocate an fp32 copy — at GH200 scale (1M ctx / batch 256) the
+    # fp32->bf16 cast peak is ~3x the bf16 footprint and OOMs before the kernel runs.
+    fp8 = cfg.kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    gen_dtype = torch.bfloat16 if fp8 else cfg.kv_dtype
     kv_data = torch.randn(
         num_blocks,
         2,
         cfg.page_size,
         cfg.num_kv_heads,
         cfg.head_dim,
+        dtype=gen_dtype,
         device=device,
-    ).to(cfg.kv_dtype)
+    )
+    if fp8:
+        kv_data = kv_data.to(cfg.kv_dtype)
     k_cache = kv_data[:, 0]
     v_cache = kv_data[:, 1]
     return q, k_cache, v_cache, kv_indptr, kv_indices, last_page_len
@@ -179,7 +187,7 @@ def pretty_print(cfg: Config, windows: List[int], results: List[dict], fractions
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--batch", type=int, default=32)  # GH200 (120GB): fill the GPU; 5090 default was 8
     ap.add_argument("--seq-len", type=int, default=128000)
     ap.add_argument("--num-qo-heads", type=int, default=16)
     ap.add_argument("--num-kv-heads", type=int, default=16)
@@ -190,7 +198,8 @@ def main():
                     help="Use the cuda-core decode kernel (default: tensor-core 3D split-KV path)")
     ap.add_argument("--windows", type=int, nargs="+",
                     default=None,
-                    help="Window sizes to sweep (default: 128, 512, 2048, 8192, 32768, seq_len)")
+                    help="Window sizes to sweep "
+                         "(default: 128, 512, 2048, 8192, 32768, 65536, 131072, seq_len; capped at seq_len)")
     ap.add_argument("--mixed-fractions", type=float, nargs="+", default=[0.5, 0.7, 0.9],
                     help="Local-head fractions for the mixed-router columns")
     args = ap.parse_args()
@@ -218,7 +227,9 @@ def main():
     windows = args.windows
     if windows is None:
         # ×4 geometric sweep, plus seq_len as the full-attention reference.
-        windows = [128, 512, 2048, 8192, 32768, cfg.seq_len]
+        # Extended past 32768 for GH200 (120GB) — at batch=32/seq=128k the larger
+        # windows still fit; entries above seq_len are dropped by the cap below.
+        windows = [128, 512, 2048, 8192, 32768, 65536, 131072, cfg.seq_len]
     windows = sorted({w for w in windows if w <= cfg.seq_len})
 
     workspace = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")

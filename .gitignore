@@ -2,6 +2,10 @@
 flashinfer-whl/
 dist/
 
+# AHA router sweep job output (logs/job-ids; the canonical *.txt result tables
+# are force-added). Ignore the whole dir; keep only the committed result tables.
+benchmarks/sweep_logs/
+
 # Compile commands json file
 compile_commands.json
 

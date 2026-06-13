@@ -94,7 +94,10 @@ def print_tables(axis_name, rows, header_desc, fractions):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seq-len", type=int, default=128000)
+    # 32k (not 128k) so the extended batch range fits 120GB: at 16/16 heads, head_dim
+    # 128, bf16 the KV is ~0.5GB/batch-elem at 32k, so batch=256 -> ~68GB. (128k would
+    # OOM past ~batch 90 on GH200; was ~30 on the 32GB 5090.)
+    ap.add_argument("--seq-len", type=int, default=32768)
     ap.add_argument("--window", type=int, default=128)
     ap.add_argument("--num-qo-heads", type=int, default=16)
     ap.add_argument("--num-kv-heads", type=int, default=16)
@@ -105,7 +108,9 @@ def main():
                     help="Use the cuda-core decode kernel (default: tensor-core 3D split-KV path)")
     ap.add_argument("--mixed-fractions", type=float, nargs="+", default=[0.5, 0.7, 0.9],
                     help="Local-head fractions for the mixed-router columns")
-    ap.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64])
+    # Extended to 128/256 for GH200 (120GB); top points OOM-skip gracefully if too big.
+    ap.add_argument("--batches", type=int, nargs="+",
+                    default=[1, 2, 4, 8, 16, 32, 64, 128, 256])
     args = ap.parse_args()
 
     dt = torch.bfloat16 if args.kv_dtype == "bf16" else torch.float16
